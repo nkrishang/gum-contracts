@@ -1,66 +1,181 @@
-## Foundry
+# gum-contracts
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Smart contracts for Gum's stablecoin payments: counterfactual payment addresses that settle themselves on deployment, a batch sweeper for executing many of them at once, and a trust-minimized forwarder for bridging merchant withdrawals over Circle's CCTP V2.
 
-Foundry consists of:
+Every contract is **ownerless, permissionless and non-upgradeable**. Where funds can go is fixed by an address or a signature before any transaction is sent, so whoever relays a transaction never gets to choose where the money lands.
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+Built with [Foundry](https://book.getfoundry.sh/) and [Solady](https://github.com/Vectorized/solady).
 
-## Documentation
+## Contracts
 
-https://book.getfoundry.sh/
+| Contract | Purpose |
+| --- | --- |
+| [`PaymentFactory`](src/PaymentFactory.sol) | Ownerless CREATE3 deployer that derives a deterministic payment address from the payment's terms and executes it. |
+| [`Payment`](src/Payment.sol) | Single-use contract whose constructor pays the receiver and sends everything else to a recovery address. |
+| [`BatchSweeper`](src/BatchSweeper.sol) | Executes many independent payments in one transaction; one failure never rolls back the others. |
+| [`WithdrawalForwarder`](src/WithdrawalForwarder.sol) | Bridges USDC through CCTP V2 on the strength of one EIP-3009 signature that commits to the destination. |
+| [`MockStablecoin`](src/mock/MockStablecoin.sol) | Local-only six-decimal token mirroring Circle FiatToken's pause, blacklist and EIP-3009 behaviour. |
 
-## Usage
+## How payments work
 
-### Build
+A payment is described by seven parameters:
 
-```shell
-$ forge build
+| Parameter | Meaning |
+| --- | --- |
+| `token` | The ERC-20 being paid |
+| `amount` | The amount owed to the receiver |
+| `receiver` | Who gets paid |
+| `expirationTimestamp` | After this, the payment no longer settles |
+| `recovery` | Where any funds that aren't owed to the receiver go |
+| `salt` | Distinguishes otherwise identical payments |
+| `chainId` | The only chain on which the payment may settle |
+
+`PaymentFactory` hashes all seven into a CREATE3 salt, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given.
+
+```
+1. Quote     factory.paymentAddress(...)  ->  counterfactual address, no code yet
+2. Pay       payer sends tokens to that address with an ordinary ERC-20 transfer
+3. Execute   anyone calls factory.execute(...)  ->  Payment is deployed, and its
+             constructor routes the balance it finds at its own address
 ```
 
-### Test
+What the `Payment` constructor does with the balance:
+
+| Situation | Outcome |
+| --- | --- |
+| Funded, not expired | `amount` goes to `receiver`, any excess to `recovery`. Emits `Settled`, and `SETTLED` is `true`. |
+| Underfunded, not expired | Reverts with `InsufficientTokenBalance`. No code is left behind, so `execute` can be retried once the balance arrives. |
+| Expired (`block.timestamp > expirationTimestamp`) | The whole balance goes to `recovery`. Emits `Recovered`. |
+| Wrong chain (`block.chainid != chainId`) | Moves nothing and emits `WrongChain`. Deployment still succeeds, even if `token` has no code on this chain, so `recover` stays callable. |
+
+After deployment, `recover(token)` is a permissionless call that forwards the contract's full balance of **any** token to `recovery`. It covers late payments, payments in the wrong token, and funds sent on the wrong chain.
+
+Things worth knowing when integrating:
+
+- `execute` surfaces constructor failures as Solady's `CREATE3.DeploymentFailed`, not the inner error. Both an underfunded payment and an already-executed payment revert this way; tell them apart by checking whether the address has code. [`test/ExecuteRevert.t.sol`](test/ExecuteRevert.t.sol) pins this behaviour.
+- Settlement is atomic. If the excess can't be delivered to `recovery` (for example, a blacklisted address), the whole deployment reverts and the receiver is not paid either.
+- The expiry boundary is inclusive: a payment executed at exactly `expirationTimestamp` still settles.
+- The factory must live at the same address on every supported chain so that the same terms produce the same payment address everywhere. That is what makes funds sent on the wrong chain recoverable.
+
+### Batch sweeping
+
+`BatchSweeper.executeBatch(Sweep[])` processes each item independently:
+
+- If the payment address has no code, it calls `factory.execute`.
+- If the payment is already deployed, it calls `recover` instead, picking up any funds that arrived late.
+- Failures are caught and reported as `SweepFailed(paymentAddress, token, revertData)` rather than reverting the batch, so a paused token, a blacklisted receiver or an underfunded item only affects itself.
+
+## How withdrawals work
+
+`WithdrawalForwarder` lets a relayer bridge a merchant's USDC to another chain without the merchant sending a transaction, and without the relayer being trusted with the destination.
+
+1. The merchant signs an EIP-3009 `ReceiveWithAuthorization` naming the forwarder as payee. The authorization's nonce is a commitment to the destination:
+
+   ```solidity
+   nonce = keccak256(abi.encode(destinationDomain, mintRecipient, salt))
+   ```
+
+   `bridgeNonce(...)` computes this on-chain for convenience.
+2. Anyone relays `bridge(token, from, value, destinationDomain, mintRecipient, salt, validBefore, signature)`.
+3. The forwarder recomputes the nonce from the arguments it was given, pulls the funds with `receiveWithAuthorization`, and burns them via CCTP V2 `depositForBurn` towards `mintRecipient`.
+
+A relayer that substitutes its own recipient produces a nonce the merchant never signed, so USDC rejects the signature before any funds move. USDC also requires the payee itself to submit a `ReceiveWithAuthorization`, so only the forwarder can consume it, and the only thing the forwarder can do with the funds is burn them towards the signed recipient.
+
+The forwarder is stateless and holds nothing between transactions. It uses Standard Transfers only (`minFinalityThreshold = 2000`, `maxFee = 0`), so the recipient is minted the full amount. `destinationCaller` is left empty, meaning any relayer may submit the mint on the destination chain.
+
+Same-chain withdrawals don't involve the forwarder: they are a relayed EIP-3009 `transferWithAuthorization` directly on the token. This is also the path used for USDT (Tether's USDT0).
+
+## Getting started
+
+Requires [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```shell
-$ forge test
+git clone --recurse-submodules <repo-url>
+cd gum-contracts
+forge build
 ```
 
-### Format
+If you cloned without submodules, run `git submodule update --init --recursive`.
+
+## Testing
 
 ```shell
-$ forge fmt
+forge test
 ```
 
-### Gas Snapshots
+The default run is fully offline. Fork tests are skipped unless you opt in:
 
 ```shell
-$ forge snapshot
+GUM_FORK_TESTS=1 forge test
 ```
 
-### Anvil
+Fork tests exercise the forwarder against the live USDC and CCTP V2 contracts, and verify that USDT0 accepts the EIP-3009 authorizations and EIP-712 domain the backend reconstructs. Each chain uses a public RPC by default, which you can override:
+
+| Chain | Chain ID | RPC override | Covers |
+| --- | --- | --- | --- |
+| Monad | `143` | `GUM_FORK_RPC_URL_143` | USDC + CCTP, USDT0 |
+| Base | `8453` | `GUM_FORK_RPC_URL_8453` | USDC + CCTP |
+| Arbitrum | `42161` | `GUM_FORK_RPC_URL_42161` | USDC + CCTP, USDT0 |
+
+CI runs `forge fmt --check`, `forge build --sizes` and `forge test -vvv` on every push and pull request.
+
+## Local development
+
+[`LocalBootstrap.s.sol`](script/LocalBootstrap.s.sol) deploys deterministic fixtures to a fresh Anvil and tops up Anvil accounts #0 and #1 with 1,000,000 of each mock token:
 
 ```shell
-$ anvil
+anvil
+
+forge script script/LocalBootstrap.s.sol:LocalBootstrapScript \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
 ```
 
-### Deploy
+The key above is Anvil's well-known account #0. The fixtures are that account's first four CREATE addresses:
+
+| Fixture | Address |
+| --- | --- |
+| `PaymentFactory` | `0x5FbDB2315678afecb367f032d93F642f64180aa3` |
+| `MockStablecoin` (USDC) | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
+| `BatchSweeper` | `0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0` |
+| `MockStablecoin` (USDT) | `0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9` |
+
+The script is idempotent, and it refuses to run if the bytecode at a fixture address doesn't match the current build. If you change a contract, restart Anvil before bootstrapping again. On every run it prints `GUM_FACTORY_CODE_HASH` and `GUM_BATCH_SWEEPER_CODE_HASH` for the services that pin a contract generation by code hash.
+
+## Deployment
+
+[`Bootstrap.s.sol`](script/Bootstrap.s.sol) deploys one generation: a `PaymentFactory`, the `BatchSweeper` bound to it, and the `WithdrawalForwarder` bound to the chain's CCTP V2 `TokenMessengerV2`.
 
 ```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+GUM_CHAIN_ID=<chain-id> forge script script/Bootstrap.s.sol:BootstrapScript \
+  --rpc-url <rpc-url> \
+  --private-key <fresh-deployer-key> \
+  --broadcast
 ```
 
-### Cast
+- **Use a fresh deployer key, and the same key on every chain.** All three contracts are plain CREATE deployments, so their addresses depend only on the deployer and its nonce. The script requires nonce `0` to guarantee identical addresses across chains.
+- `GUM_CHAIN_ID` must match the chain behind the RPC URL; the script aborts otherwise.
+- The forwarder defaults to Circle's mainnet `TokenMessengerV2`, `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d`, which is the same on every supported chain. On a testnet, set `GUM_TOKEN_MESSENGER_V2`. The script aborts if the address has no code.
+- `Payment`'s creation code is embedded in the factory, so **any change to `Payment` requires a new generation**, deployed from a new key.
+- The script prints `GUM_FACTORY_ADDRESS`, `GUM_BATCH_SWEEPER_ADDRESS`, `GUM_WITHDRAWAL_FORWARDER_ADDRESS` and their code hashes for the backend's environment.
 
-```shell
-$ cast <subcommand>
+## Project layout
+
+```
+src/
+  Payment.sol               Self-settling payment contract
+  PaymentFactory.sol        CREATE3 factory and address derivation
+  BatchSweeper.sol          Batched execute / recover
+  WithdrawalForwarder.sol   EIP-3009 + CCTP V2 withdrawal bridge
+  mock/MockStablecoin.sol   FiatToken-like fixture for tests and Anvil
+script/
+  Bootstrap.s.sol           Production deployment of a generation
+  LocalBootstrap.s.sol      Deterministic Anvil fixtures
+test/                       Unit, fuzz and opt-in fork tests
+lib/                        forge-std and solady (git submodules)
 ```
 
-### Help
+## License
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+The contracts are MIT licensed, per their SPDX headers.
