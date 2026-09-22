@@ -16,6 +16,22 @@ Built with [Foundry](https://book.getfoundry.sh/) and [Solady](https://github.co
 | [`WithdrawalForwarder`](src/WithdrawalForwarder.sol) | Bridges USDC through CCTP V2 on the strength of one EIP-3009 signature that commits to the destination. |
 | [`MockStablecoin`](src/mock/MockStablecoin.sol) | Local-only six-decimal token mirroring Circle FiatToken's pause, blacklist and EIP-3009 behaviour. |
 
+### Deployed addresses
+
+The current generation is live at the same addresses on Monad, Base and Arbitrum:
+
+| Contract | Address |
+| --- | --- |
+| `PaymentFactory` | `0x7D0790f8983F028bDa32c44c40b50EBE902Fe17B` |
+| `BatchSweeper` | `0xf58a0A9Df7764784dF01Aa7f10094Fc1A5a72b97` |
+| `WithdrawalForwarder` | `0x7f66A10D96d369Dab93e121415772b9F752Bc0d1` |
+
+| Chain | Chain ID |
+| --- | --- |
+| Monad | `143` |
+| Base | `8453` |
+| Arbitrum | `42161` |
+
 ## How payments work
 
 A payment is described by seven parameters:
