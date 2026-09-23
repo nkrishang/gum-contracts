@@ -6,7 +6,6 @@ import {stdError} from "lib/forge-std/src/StdError.sol";
 import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {ERC4626} from "lib/solady/src/tokens/ERC4626.sol";
-import {LibCall} from "lib/solady/src/utils/LibCall.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
@@ -365,7 +364,7 @@ contract PaymentCallsTest is PaymentCallsBase {
     /// no call can spend more than `amount`.
     function test_calls_cannot_spend_the_excess() public {
         _fundDirect(12e6);
-        vm.expectRevert(ERC20.InsufficientBalance.selector);
+        vm.expectRevert(_callFailed(0, abi.encodeWithSelector(ERC20.InsufficientBalance.selector)));
         _deployDirect(10e6, _list(_transfer(MERCHANT, 10e6 + 1)));
     }
 
@@ -437,24 +436,25 @@ contract PaymentCallsTest is PaymentCallsBase {
         assertFalse(Payment(payment).SETTLED());
     }
 
-    /// @notice A failing call bubbles up the target's own revert data unchanged.
-    function test_a_failed_call_bubbles_up_the_target_revert() public {
+    /// @notice A failing call reports its index, with the target's own revert
+    /// data unchanged inside.
+    function test_a_failed_call_reports_its_index_and_revert_data() public {
         Payment.Call memory pay = _transfer(MERCHANT, 10e6);
 
         _fundDirect(10e6);
-        vm.expectRevert(abi.encodeWithSelector(Reverter.Refused.selector, 42));
+        vm.expectRevert(_callFailed(1, abi.encodeWithSelector(Reverter.Refused.selector, 42)));
         _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.customError, ()))));
 
         _fundDirect(10e6);
-        vm.expectRevert("refused");
+        vm.expectRevert(_callFailed(1, abi.encodeWithSignature("Error(string)", "refused")));
         _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.stringError, ()))));
 
         _fundDirect(10e6);
-        vm.expectRevert(stdError.divisionError);
+        vm.expectRevert(_callFailed(1, stdError.divisionError));
         _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.panic, (0)))));
 
         _fundDirect(10e6);
-        vm.expectRevert(bytes(""));
+        vm.expectRevert(_callFailed(1, ""));
         _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.empty, ()))));
     }
 
@@ -464,13 +464,13 @@ contract PaymentCallsTest is PaymentCallsBase {
         address[3] memory codeless = [address(0xE0A), address(0x04), address(0)];
         for (uint256 i; i < codeless.length; ++i) {
             _fundDirect(10e6);
-            vm.expectRevert(LibCall.TargetIsNotContract.selector);
+            vm.expectRevert(abi.encodeWithSelector(Payment.CallTargetHasNoCode.selector, 1, codeless[i]));
             _deployDirect(10e6, _list(_transfer(MERCHANT, 10e6), _call(codeless[i], "")));
         }
 
         // Calldata makes no difference to an address without code: it still returns nothing.
         _fundDirect(10e6);
-        vm.expectRevert(LibCall.TargetIsNotContract.selector);
+        vm.expectRevert(abi.encodeWithSelector(Payment.CallTargetHasNoCode.selector, 1, address(0xE0A)));
         _deployDirect(
             10e6,
             _list(_transfer(MERCHANT, 10e6), _call(address(0xE0A), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6))))
@@ -482,7 +482,7 @@ contract PaymentCallsTest is PaymentCallsBase {
     function test_a_call_cannot_call_back_into_the_payment() public {
         Reentrant reentrant = new Reentrant();
         _fundDirect(10e6);
-        vm.expectRevert(bytes(""));
+        vm.expectRevert(_callFailed(1, ""));
         _deployDirect(
             10e6,
             _list(
@@ -696,5 +696,9 @@ contract PaymentCallsTest is PaymentCallsBase {
         vm.expectRevert(SafeTransferLib.TransferFromFailed.selector);
         spender.pullFrom(address(token), payment, address(0xBAD), 5e6);
         assertEq(Payment(payment).recover(address(token)), 5e6);
+    }
+
+    function _callFailed(uint256 index, bytes memory revertData) private pure returns (bytes memory) {
+        return abi.encodeWithSelector(Payment.CallFailed.selector, index, revertData);
     }
 }

@@ -20,7 +20,7 @@ What the constructor does:
 2. **Expired:** send the whole balance to `recovery` and return. No calls run. (unchanged)
 3. **Underfunded:** revert `InsufficientTokenBalance`. (unchanged)
 4. **Excess to `recovery` first**, so the calls can only ever spend `amount`.
-5. **Run each call in order.** Calls go through Solady's `LibCall.callContract`: a failed call bubbles up its own revert, and a call to an address without code reverts `TargetIsNotContract()`. After each call it emits `Called(i, target, data, result)`.
+5. **Run each call in order.** Calls go through Solady's `LibCall.tryCall`. A failed call reverts `CallFailed(i, revertData)`, which carries the target's own revert data. A call that returns nothing from an address without code reverts `CallTargetHasNoCode(i, target)`. The index lives in the revert data, not in an event: logs from a reverted call are dropped, including by geth's `callTracer`. After each call it emits `Called(i, target, data, result)`.
 6. **Require the balance to be zero**, i.e. exactly `amount` was spent. Otherwise it reverts `AmountNotSpent(remaining)`.
 7. Set `SETTLED = true` and emit `Settled(token, amount)`.
 

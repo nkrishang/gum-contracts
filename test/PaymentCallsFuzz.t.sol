@@ -61,7 +61,11 @@ contract PaymentCallsFuzzTest is PaymentCallsBase {
         _fundDirect(amount + excess);
         if (spend > amount) {
             // The excess has already gone to recovery, so the transfer itself fails.
-            vm.expectRevert(ERC20.InsufficientBalance.selector);
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    Payment.CallFailed.selector, 0, abi.encodeWithSelector(ERC20.InsufficientBalance.selector)
+                )
+            );
         } else {
             vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, amount - spend));
         }
