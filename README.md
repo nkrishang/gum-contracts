@@ -60,7 +60,7 @@ What the `Payment` constructor does with the balance:
 | Situation | Outcome |
 | --- | --- |
 | Funded, not expired | Any excess goes to `recovery` first. The calls then run in order and must spend exactly `amount`. Emits `Recovered` for any excess, `Called` after each call, then `Settled`, and `SETTLED` is `true`. |
-| A call reverts, targets an address with no code, or the calls leave part of `amount` unspent | Reverts with `CallFailed`, `CallTargetHasNoCode` or `AmountNotSpent`. Nothing moves, and `execute` can be retried. |
+| A call reverts, targets an address with no code, or the calls leave part of `amount` unspent | Reverts with the failing call's own revert data, `LibCall.TargetIsNotContract`, or `AmountNotSpent`. Nothing moves, and `execute` can be retried. |
 | Underfunded, not expired | Reverts with `InsufficientTokenBalance`. No code is left behind, so `execute` can be retried once the balance arrives. |
 | Expired (`block.timestamp > expirationTimestamp`) | The whole balance goes to `recovery`. Emits `Recovered`. |
 | Wrong chain (`block.chainid != chainId`) | Moves nothing and emits `WrongChain`. Deployment still succeeds, even if `token` has no code on this chain, so `recover` stays callable. |
@@ -89,7 +89,7 @@ Rules the calls must follow:
 
 - **Every target and every byte of calldata is committed into the address.** Anyone can therefore verify what a payment will do offchain, before paying, by recomputing the address. The contracts enforce no allowlist, and the chosen calls are exactly what runs.
 - **Calls run as the payment address, inside its constructor.** The payment has no code yet, so a target that calls back into it, such as a swap callback or a flash-loan callback, fails. Targets should not care who calls them. A target that must know it was paid should pull the tokens with `transferFrom` rather than trust `msg.sender`. Alternatively, it can take the payment's terms as arguments and check that the factory derives `msg.sender` from them; `AuthenticatedOrderBook` in [`test/utils/SettlementFixtures.sol`](test/utils/SettlementFixtures.sol) shows how.
-- **The calls must spend exactly `amount`.** The excess has already gone to `recovery` when they run, so they cannot spend more. Leaving any of it unspent reverts with `AmountNotSpent`. A call to an address with no code reverts with `CallTargetHasNoCode`, because it would otherwise succeed and do nothing.
+- **The calls must spend exactly `amount`.** The excess has already gone to `recovery` when they run, so they cannot spend more. Leaving any of it unspent reverts with `AmountNotSpent`. A call to an address with no code reverts with `LibCall.TargetIsNotContract`, because it would otherwise succeed and do nothing.
 - **Approvals should be exact.** An approval the target doesn't fully use outlives the constructor, and would let that spender pull late funds before `recover` sweeps them. Check this offchain along with the rest of the calls.
 - **Calls carry no native value**, and expired or wrong-chain payments never run their calls.
 

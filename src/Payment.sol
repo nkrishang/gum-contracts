@@ -2,6 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
+import {LibCall} from "lib/solady/src/utils/LibCall.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 
 /// @notice Deployed by `PaymentFactory` at a counterfactual address.
@@ -13,7 +14,9 @@ import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 /// recovery address.
 ///
 /// Calls run as this contract, and before it has code. A call target must be a
-/// contract, and must not call back into the payment.
+/// contract, and must not call back into the payment. A failing call bubbles up
+/// its revert, and a call to an address without code reverts with
+/// `LibCall.TargetIsNotContract`.
 contract Payment {
     //---------- Structs ----------//
 
@@ -27,10 +30,6 @@ contract Payment {
 
     /// @notice Emitted when the contract token balance is less than the target amount.
     error InsufficientTokenBalance(uint256 balance, uint256 required);
-    /// @notice Emitted when a call target has no code, since such a call would succeed without doing anything.
-    error CallTargetHasNoCode(uint256 index, address target);
-    /// @notice Emitted when a call reverts.
-    error CallFailed(uint256 index, bytes revertData);
     /// @notice Emitted when the calls leave part of the target amount unspent.
     error AmountNotSpent(uint256 remaining);
 
@@ -90,9 +89,9 @@ contract Payment {
 
         for (uint256 i; i < calls.length; ++i) {
             Call memory call = calls[i];
-            if (call.target.code.length == 0) revert CallTargetHasNoCode(i, call.target);
-            (bool success, bytes memory result) = call.target.call(call.data);
-            if (!success) revert CallFailed(i, result);
+            // Bubbles up a revert, and rejects an address without code, where a call
+            // would otherwise succeed without doing anything.
+            bytes memory result = LibCall.callContract(call.target, call.data);
             emit Called(i, call.target, call.data, result);
         }
 
