@@ -1,316 +1,700 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import {Test} from "lib/forge-std/src/Test.sol";
+import {Vm} from "lib/forge-std/src/Vm.sol";
+import {stdError} from "lib/forge-std/src/StdError.sol";
 import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {ERC4626} from "lib/solady/src/tokens/ERC4626.sol";
+import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
+import {ITokenMessengerV2} from "src/WithdrawalForwarder.sol";
+import {MockTokenMessenger} from "test/WithdrawalForwarder.t.sol";
+import {
+    AuthenticatedOrderBook,
+    Boomerang,
+    Checkout,
+    FalseReturningToken,
+    Gate,
+    GasBurner,
+    MockVault,
+    OpenSpender,
+    OrderBook,
+    PaymentCallsBase,
+    Reentrant,
+    Reverter
+} from "test/utils/SettlementFixtures.sol";
 
-contract MockVault is ERC4626 {
-    address internal immutable _asset;
-
-    constructor(address asset_) {
-        _asset = asset_;
-    }
-
-    function asset() public view override returns (address) {
-        return _asset;
-    }
-
-    function name() public pure override returns (string memory) {
-        return "Mock Vault";
-    }
-
-    function symbol() public pure override returns (string memory) {
-        return "mVAULT";
-    }
-}
-
-/// @dev Stands in for a merchant contract that is temporarily unable to accept an order.
-contract Gate {
-    bool public open;
-    uint256 public passes;
-
-    function setOpen(bool open_) external {
-        open = open_;
-    }
-
-    function pass() external {
-        require(open, "closed");
-        passes++;
-    }
-}
-
-/// @dev Calls back into its caller, which is a `Payment` still under construction.
-contract Reentrant {
-    function recoverFromCaller(address token) external {
-        Payment(msg.sender).recover(token);
-    }
-}
-
-contract PaymentDirectDeployer {
-    function deploy(
-        address token,
-        uint256 amount,
-        Payment.Call[] memory calls,
-        uint64 expirationTimestamp,
-        address recovery,
-        uint256 chainId
-    ) external returns (Payment) {
-        return new Payment(token, amount, calls, expirationTimestamp, recovery, chainId);
-    }
-}
-
-contract PaymentCallsTest is Test {
-    event Called(uint256 indexed index, address indexed target, bytes data, bytes result);
-    event Settled(address indexed token, uint256 amount);
-    event Recovered(address indexed recovery, address indexed token, uint256 amount);
-
-    MockStablecoin internal token;
-    PaymentFactory internal factory;
+/// @notice Settlement calls: what a payment may do on settlement, and every way
+/// the constructor holds it to exactly the committed calls and exactly `amount`.
+contract PaymentCallsTest is PaymentCallsBase {
     MockVault internal vault;
     Gate internal gate;
+    Reverter internal reverter;
 
-    address internal constant MERCHANT = address(0xBEEF);
-    address internal constant PLATFORM = address(0xFEE);
-    address internal constant RECOVERY = address(0xCAFE);
-
-    function setUp() public {
-        token = new MockStablecoin("Mock USD Coin", "USDC");
-        factory = new PaymentFactory();
+    function setUp() public override {
+        super.setUp();
         vault = new MockVault(address(token));
         gate = new Gate();
+        reverter = new Reverter();
     }
 
-    /// @notice The canonical action: approve a vault and deposit on the merchant's
-    /// behalf. Each call is reported with its calldata and return data.
-    function test_approve_and_deposit_settles_into_a_vault() public {
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.approve, (address(vault), 10e6)));
-        calls[1] = _call(address(vault), abi.encodeCall(ERC4626.deposit, (10e6, MERCHANT)));
-        (address paymentAddress, uint64 expirationTimestamp) = _fund(10e6, calls, 10e6);
+    //---------- Commitment ----------//
 
-        vm.expectEmit(true, true, true, true, paymentAddress);
-        emit Called(0, address(token), calls[0].data, abi.encode(true));
-        vm.expectEmit(true, true, true, true, paymentAddress);
-        emit Called(1, address(vault), calls[1].data, abi.encode(uint256(10e6)));
-        vm.expectEmit(true, true, true, true, paymentAddress);
-        emit Settled(address(token), 10e6);
-        _execute(10e6, calls, expirationTimestamp);
-
-        assertEq(vault.balanceOf(MERCHANT), 10e6, "the merchant holds the vault shares");
-        assertEq(token.balanceOf(address(vault)), 10e6);
-        assertEq(token.balanceOf(paymentAddress), 0);
-        assertTrue(Payment(paymentAddress).SETTLED());
+    /// @notice The address is the documented hash of the terms, so gum-server
+    /// can derive it without calling the factory.
+    function test_address_derivation_matches_the_documented_formula() public view {
+        Payment.Call[] memory calls = _list(_approve(address(vault), 10e6), _call(address(vault), hex"c0ffee"));
+        bytes32 salt = keccak256(abi.encode(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid));
+        assertEq(_address(10e6, calls), CREATE3.predictDeterministicAddress(salt, address(factory)));
     }
 
-    function test_calls_can_split_the_amount_between_recipients() public {
+    /// @notice A fixed vector for other implementations of the derivation,
+    /// cross-checked with `cast abi-encode` + `cast keccak`. The CREATE3 salt
+    /// depends only on the terms; the address then depends on the factory.
+    function test_deployment_salt_vector() public view {
         Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, 9.7e6)));
-        calls[1] = _call(address(token), abi.encodeCall(ERC20.transfer, (PLATFORM, 0.3e6)));
-        (, uint64 expirationTimestamp) = _fund(10e6, calls, 10e6);
+        calls[0] = Payment.Call({
+            target: 0x1111111111111111111111111111111111111111,
+            data: abi.encodeWithSignature("transfer(address,uint256)", address(0xBEEF), uint256(10e6))
+        });
+        calls[1] = Payment.Call({target: 0x2222222222222222222222222222222222222222, data: hex"01"});
+        bytes32 salt = keccak256(
+            abi.encode(
+                0x1111111111111111111111111111111111111111,
+                uint256(10e6),
+                calls,
+                uint64(1_700_000_000),
+                address(0xCAFE),
+                bytes32(uint256(7)),
+                uint256(8453)
+            )
+        );
+        assertEq(salt, 0x3ef67ee909666dc854602dc4af5e8bf318c0737e8653d1659d0b51259f339799, "salt vector");
+        assertEq(
+            factory.paymentAddress(
+                0x1111111111111111111111111111111111111111,
+                10e6,
+                calls,
+                1_700_000_000,
+                address(0xCAFE),
+                bytes32(uint256(7)),
+                8453
+            ),
+            CREATE3.predictDeterministicAddress(salt, address(factory)),
+            "the factory uses exactly this salt"
+        );
+    }
 
-        _execute(10e6, calls, expirationTimestamp);
+    /// @notice Every target, every byte of calldata, their order and their count
+    /// are committed, so no executor can alter what a payment does.
+    function test_address_commits_to_every_call_field() public view {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6), _call(address(gate), hex"01"));
+        address committed = _address(10e6, calls);
+
+        assertNotEq(_address(10e6, _list(_transfer(PLATFORM, 10e6), calls[1])), committed, "the recipient in calldata");
+        assertNotEq(_address(10e6, _list(calls[0], _call(address(vault), hex"01"))), committed, "a target");
+        assertNotEq(_address(10e6, _list(calls[0], _call(address(gate), hex"02"))), committed, "a calldata byte");
+        assertNotEq(_address(10e6, _list(calls[0], _call(address(gate), ""))), committed, "calldata length");
+        assertNotEq(_address(10e6, _list(calls[1], calls[0])), committed, "the order");
+        assertNotEq(_address(10e6, _list(calls[0])), committed, "a dropped call");
+        assertNotEq(_address(10e6, _list(calls[0], calls[1], calls[1])), committed, "a repeated call");
+        assertNotEq(_address(10e6, _list()), _address(10e6, _list(_call(address(gate), ""))), "an empty call");
+    }
+
+    /// @notice An executor that submits different calls deploys a different,
+    /// empty payment; the funded one is untouched and still settles as committed.
+    function test_executing_other_calls_cannot_touch_a_funded_payment() public {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6));
+        address payment = _fund(10e6, calls, 10e6);
+        Payment.Call[] memory redirected = _list(_transfer(address(0xBAD), 10e6));
+
+        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        _execute(10e6, redirected);
+        assertEq(token.balanceOf(payment), 10e6);
+        assertEq(payment.code.length, 0);
+
+        _execute(10e6, calls);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+        assertEq(token.balanceOf(address(0xBAD)), 0);
+    }
+
+    //---------- Settlement shapes ----------//
+
+    function test_single_transfer_is_a_plain_payment() public {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6));
+        address payment = _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
+
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+        assertEq(token.balanceOf(RECOVERY), 0);
+        assertEq(token.balanceOf(payment), 0);
+        assertTrue(Payment(payment).SETTLED());
+    }
+
+    function test_calls_split_the_amount_between_recipients() public {
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 9.7e6), _transfer(PLATFORM, 0.25e6), _transfer(address(0xA11CE), 0.05e6));
+        _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
 
         assertEq(token.balanceOf(MERCHANT), 9.7e6);
-        assertEq(token.balanceOf(PLATFORM), 0.3e6);
+        assertEq(token.balanceOf(PLATFORM), 0.25e6);
+        assertEq(token.balanceOf(address(0xA11CE)), 0.05e6);
     }
 
-    /// @notice A call that moves less than the amount (or nothing at all) must
-    /// not count as settlement: it would silently strand the merchant's money.
-    function test_underspending_calls_revert_with_amount_not_spent() public {
-        PaymentDirectDeployer deployer = new PaymentDirectDeployer();
-        address predicted = vm.computeCreateAddress(address(deployer), vm.getNonce(address(deployer)));
-        token.mint(predicted, 10e6);
-
-        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 1));
-        deployer.deploy(
-            address(token), 10e6, _pay(MERCHANT, 10e6 - 1), uint64(block.timestamp + 1 hours), RECOVERY, block.chainid
+    function test_approve_and_deposit_settles_into_a_vault() public {
+        Payment.Call[] memory calls = _list(
+            _approve(address(vault), 10e6), _call(address(vault), abi.encodeCall(ERC4626.deposit, (10e6, MERCHANT)))
         );
+        address payment = _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
+
+        assertEq(vault.balanceOf(MERCHANT), 10e6, "the merchant holds the shares");
+        assertEq(vault.totalAssets(), 10e6);
+        assertEq(token.allowance(payment, address(vault)), 0, "an exact approval is fully used");
+        assertTrue(Payment(payment).SETTLED());
+    }
+
+    /// @notice A merchant contract that pulls its price learns it was paid
+    /// from the pull itself, and records the payment address as the payer.
+    function test_pull_based_checkout_records_the_payment_as_payer() public {
+        Checkout checkout = new Checkout(address(token), MERCHANT);
+        bytes32 orderId = keccak256("order-1");
+        Payment.Call[] memory calls = _list(
+            _approve(address(checkout), 10e6), _call(address(checkout), abi.encodeCall(Checkout.pay, (orderId, 10e6)))
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectEmit(true, true, true, true, address(checkout));
+        emit Checkout.OrderPaid(orderId, payment, 10e6);
+        _execute(10e6, calls);
+
+        assertEq(checkout.paidBy(orderId), payment);
+        assertEq(token.balanceOf(MERCHANT), 10e6, "the checkout forwarded the price to its treasury");
+    }
+
+    function test_transfer_then_notify_a_merchant_contract() public {
+        OrderBook book = new OrderBook();
+        bytes32 orderId = keccak256("order-2");
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(book), abi.encodeCall(OrderBook.markPaid, (orderId))));
+        address payment = _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
+
+        assertEq(book.notifiedBy(orderId), payment, "the target sees the payment address as the caller");
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    /// @notice A call that moves no tokens may come before the transfer.
+    function test_notify_may_precede_the_transfer() public {
+        OrderBook book = new OrderBook();
+        bytes32 orderId = keccak256("order-3");
+        Payment.Call[] memory calls =
+            _list(_call(address(book), abi.encodeCall(OrderBook.markPaid, (orderId))), _transfer(MERCHANT, 10e6));
+        address payment = _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
+
+        assertEq(book.notifiedBy(orderId), payment);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    /// @notice Settling straight into a CCTP burn: approve the messenger and
+    /// burn towards a recipient on another chain.
+    function test_approve_and_cctp_burn_settles_cross_chain() public {
+        MockTokenMessenger messenger = new MockTokenMessenger();
+        bytes32 recipient = bytes32(uint256(uint160(MERCHANT)));
+        Payment.Call[] memory calls = _list(
+            _approve(address(messenger), 10e6),
+            _call(
+                address(messenger),
+                abi.encodeCall(
+                    ITokenMessengerV2.depositForBurn, (10e6, 3, recipient, address(token), bytes32(0), 0, 2000)
+                )
+            )
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectEmit(true, true, true, true, address(messenger));
+        emit MockTokenMessenger.DepositForBurn(10e6, 3, recipient, address(token));
+        _execute(10e6, calls);
+
+        assertEq(token.balanceOf(address(messenger)), 10e6);
+        assertEq(token.balanceOf(payment), 0);
+    }
+
+    /// @notice A merchant contract can authenticate a notification by rebuilding
+    /// the committed calls and checking that the factory derives the caller.
+    function test_authenticated_order_book_accepts_a_genuine_payment() public {
+        AuthenticatedOrderBook book = new AuthenticatedOrderBook(factory, MERCHANT, 10e6);
+        bytes32 orderId = keccak256("order-4");
+        Payment.Call[] memory previous = _list(_transfer(MERCHANT, 10e6));
+        Payment.Call[] memory calls = _list(
+            previous[0],
+            _call(
+                address(book),
+                abi.encodeCall(
+                    AuthenticatedOrderBook.markPaid, (orderId, address(token), 10e6, previous, expiry, RECOVERY, SALT)
+                )
+            )
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        _execute(10e6, calls);
+
+        assertEq(book.paidBy(orderId), payment);
+    }
+
+    function test_authenticated_order_book_rejects_a_spoofed_caller() public {
+        AuthenticatedOrderBook book = new AuthenticatedOrderBook(factory, MERCHANT, 10e6);
+        Payment.Call[] memory previous = _list(_transfer(MERCHANT, 10e6));
+
+        vm.expectRevert("not a genuine payment");
+        vm.prank(address(0xBAD));
+        book.markPaid(keccak256("order-5"), address(token), 10e6, previous, expiry, RECOVERY, SALT);
+    }
+
+    /// @notice A genuine payment whose earlier calls don't pay the merchant is
+    /// caught too, because the book can trust the calls it rebuilt.
+    function test_authenticated_order_book_rejects_a_payment_that_underpays() public {
+        AuthenticatedOrderBook book = new AuthenticatedOrderBook(factory, MERCHANT, 10e6);
+        bytes32 orderId = keccak256("order-6");
+        Payment.Call[] memory previous = _list(_transfer(PLATFORM, 10e6));
+        Payment.Call[] memory calls = _list(
+            previous[0],
+            _call(
+                address(book),
+                abi.encodeCall(
+                    AuthenticatedOrderBook.markPaid, (orderId, address(token), 10e6, previous, expiry, RECOVERY, SALT)
+                )
+            )
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        _execute(10e6, calls);
+        assertEq(token.balanceOf(payment), 10e6);
+    }
+
+    /// @notice Payments compose: one payment can fund another payment's
+    /// address and execute it from within its own constructor.
+    function test_a_payment_can_fund_and_execute_another_payment() public {
+        Payment.Call[] memory innerCalls = _list(_transfer(MERCHANT, 10e6));
+        bytes32 innerSalt = keccak256("inner");
+        address inner =
+            factory.paymentAddress(address(token), 10e6, innerCalls, expiry, RECOVERY, innerSalt, block.chainid);
+        Payment.Call[] memory outerCalls = _list(
+            _transfer(inner, 10e6),
+            _call(
+                address(factory),
+                abi.encodeCall(
+                    PaymentFactory.execute,
+                    (address(token), 10e6, innerCalls, expiry, RECOVERY, innerSalt, block.chainid)
+                )
+            )
+        );
+        address outer = _fund(10e6, outerCalls, 10e6);
+
+        _execute(10e6, outerCalls);
+
+        assertTrue(Payment(outer).SETTLED());
+        assertTrue(Payment(inner).SETTLED());
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    /// @notice A zero amount settles with calls that move no tokens; the whole
+    /// balance is excess and goes to recovery first.
+    function test_zero_amount_payment_runs_its_calls_and_recovers_the_balance() public {
+        OrderBook book = new OrderBook();
+        bytes32 orderId = keccak256("order-7");
+        Payment.Call[] memory calls = _list(_call(address(book), abi.encodeCall(OrderBook.markPaid, (orderId))));
+        address payment = _fund(0, calls, 5e6);
+
+        _execute(0, calls);
+
+        assertEq(book.notifiedBy(orderId), payment);
+        assertEq(token.balanceOf(RECOVERY), 5e6);
+        assertTrue(Payment(payment).SETTLED());
+    }
+
+    /// @notice Calls run with the payment's full authority, by design: only
+    /// the committed token is metered against `amount`.
+    function test_calls_may_move_other_tokens_held_by_the_address() public {
+        MockStablecoin other = new MockStablecoin("Mock Tether", "USDT");
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(other), abi.encodeCall(ERC20.transfer, (PLATFORM, 3e6))));
+        address payment = _fund(10e6, calls, 10e6);
+        other.mint(payment, 3e6);
+
+        _execute(10e6, calls);
+
+        assertEq(other.balanceOf(PLATFORM), 3e6);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    //---------- Exact spend ----------//
+
+    function test_underspending_reverts_with_amount_not_spent() public {
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 1));
+        _deployDirect(10e6, _list(_transfer(MERCHANT, 10e6 - 1)));
     }
 
     function test_no_calls_cannot_settle_a_nonzero_amount() public {
-        Payment.Call[] memory calls = new Payment.Call[](0);
-        (address paymentAddress, uint64 expirationTimestamp) = _fund(10e6, calls, 10e6);
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 10e6));
+        _deployDirect(10e6, _list());
+    }
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
-        _execute(10e6, calls, expirationTimestamp);
-        assertEq(token.balanceOf(paymentAddress), 10e6);
+    /// @notice An approval alone moves nothing: the spender must pull.
+    function test_an_approval_that_is_never_pulled_leaves_the_amount_unspent() public {
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 10e6));
+        _deployDirect(10e6, _list(_approve(address(vault), 10e6)));
     }
 
     /// @notice The excess has already left for recovery when the calls run, so
-    /// no call can spend more than the amount.
+    /// no call can spend more than `amount`.
     function test_calls_cannot_spend_the_excess() public {
-        PaymentDirectDeployer deployer = new PaymentDirectDeployer();
-        address predicted = vm.computeCreateAddress(address(deployer), vm.getNonce(address(deployer)));
-        token.mint(predicted, 12e6);
+        _fundDirect(12e6);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Payment.CallFailed.selector, 0, abi.encodeWithSelector(ERC20.InsufficientBalance.selector)
+            )
+        );
+        _deployDirect(10e6, _list(_transfer(MERCHANT, 10e6 + 1)));
+    }
 
-        vm.expectPartialRevert(Payment.CallFailed.selector);
-        deployer.deploy(
-            address(token), 10e6, _pay(MERCHANT, 10e6 + 1), uint64(block.timestamp + 1 hours), RECOVERY, block.chainid
+    /// @notice Tokens that come back to the payment during the calls count as unspent.
+    function test_tokens_returned_to_the_payment_count_as_unspent() public {
+        Boomerang boomerang = new Boomerang();
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 10e6));
+        _deployDirect(
+            10e6,
+            _list(
+                _approve(address(boomerang), 10e6),
+                _call(address(boomerang), abi.encodeCall(Boomerang.bounce, (address(token), 10e6)))
+            )
         );
     }
 
-    /// @notice A failing call reverts the whole deployment, so the payment stays
-    /// funded and executable; the next attempt after the target recovers settles.
-    function test_failed_call_reverts_everything_and_is_retryable() public {
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6)));
-        calls[1] = _call(address(gate), abi.encodeCall(Gate.pass, ()));
-        (address paymentAddress, uint64 expirationTimestamp) = _fund(10e6, calls, 12e6);
+    /// @notice A transfer that returns `false` without reverting is a successful
+    /// call that moved nothing; the spend check catches it.
+    function test_a_silently_failing_transfer_is_caught_by_the_spend_check() public {
+        FalseReturningToken falseToken = new FalseReturningToken();
+        falseToken.setFailSilently(true);
+        address predicted = vm.computeCreateAddress(address(directDeployer), vm.getNonce(address(directDeployer)));
+        falseToken.mint(predicted, 10e6);
+        Payment.Call[] memory calls =
+            _list(_call(address(falseToken), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6))));
+
+        vm.expectRevert(abi.encodeWithSelector(Payment.AmountNotSpent.selector, 10e6));
+        directDeployer.deploy(address(falseToken), 10e6, calls, expiry, RECOVERY, block.chainid);
+    }
+
+    //---------- Failures ----------//
+
+    /// @notice A failing call reverts the whole deployment: earlier calls and
+    /// the excess roll back, and a later attempt settles once the target recovers.
+    function test_a_failed_call_reverts_everything_and_is_retryable() public {
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
+        address payment = _fund(10e6, calls, 12e6);
 
         vm.expectRevert(CREATE3.DeploymentFailed.selector);
-        _execute(10e6, calls, expirationTimestamp);
-        assertEq(paymentAddress.code.length, 0);
-        assertEq(token.balanceOf(paymentAddress), 12e6, "the earlier transfer and the excess roll back too");
+        _execute(10e6, calls);
+        assertEq(payment.code.length, 0);
+        assertEq(token.balanceOf(payment), 12e6, "the earlier transfer and the excess roll back");
         assertEq(token.balanceOf(MERCHANT), 0);
         assertEq(token.balanceOf(RECOVERY), 0);
 
         gate.setOpen(true);
-        _execute(10e6, calls, expirationTimestamp);
+        _execute(10e6, calls);
         assertEq(gate.passes(), 1);
         assertEq(token.balanceOf(MERCHANT), 10e6);
         assertEq(token.balanceOf(RECOVERY), 2e6);
     }
 
-    function test_failed_call_reports_its_index_and_revert_data() public {
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6)));
-        calls[1] = _call(address(gate), abi.encodeCall(Gate.pass, ()));
-        PaymentDirectDeployer deployer = new PaymentDirectDeployer();
-        address predicted = vm.computeCreateAddress(address(deployer), vm.getNonce(address(deployer)));
-        token.mint(predicted, 10e6);
+    /// @notice An action that never succeeds keeps the funds at the address
+    /// until expiry, and the expiry path then refunds them all.
+    function test_a_permanently_failing_action_is_refunded_after_expiry() public {
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
+        address payment = _fund(10e6, calls, 10e6);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(Payment.CallFailed.selector, 1, abi.encodeWithSignature("Error(string)", "closed"))
-        );
-        deployer.deploy(address(token), 10e6, calls, uint64(block.timestamp + 1 hours), RECOVERY, block.chainid);
-    }
+        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        _execute(10e6, calls);
 
-    /// @notice A call to an address without code succeeds and does nothing, so a
-    /// mistyped target must fail loudly instead.
-    function test_call_to_an_address_without_code_reverts() public {
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6)));
-        calls[1] = _call(address(0xE0A), "");
-        PaymentDirectDeployer deployer = new PaymentDirectDeployer();
-        address predicted = vm.computeCreateAddress(address(deployer), vm.getNonce(address(deployer)));
-        token.mint(predicted, 10e6);
-
-        vm.expectRevert(abi.encodeWithSelector(Payment.CallTargetHasNoCode.selector, 1, address(0xE0A)));
-        deployer.deploy(address(token), 10e6, calls, uint64(block.timestamp + 1 hours), RECOVERY, block.chainid);
-    }
-
-    /// @notice Calls run inside the constructor, before the payment has code, so
-    /// a target cannot call back into it.
-    function test_calls_cannot_call_back_into_the_payment() public {
-        Reentrant reentrant = new Reentrant();
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, 10e6)));
-        calls[1] = _call(address(reentrant), abi.encodeCall(Reentrant.recoverFromCaller, (address(token))));
-        PaymentDirectDeployer deployer = new PaymentDirectDeployer();
-        address predicted = vm.computeCreateAddress(address(deployer), vm.getNonce(address(deployer)));
-        token.mint(predicted, 10e6);
-
-        vm.expectPartialRevert(Payment.CallFailed.selector);
-        deployer.deploy(address(token), 10e6, calls, uint64(block.timestamp + 1 hours), RECOVERY, block.chainid);
-    }
-
-    function test_expired_payment_runs_no_calls() public {
-        gate.setOpen(true);
-        Payment.Call[] memory calls = _payAndPass(10e6);
-        (address paymentAddress, uint64 expirationTimestamp) = _fund(10e6, calls, 10e6);
-
-        vm.warp(expirationTimestamp + 1);
-        _execute(10e6, calls, expirationTimestamp);
-
-        assertEq(gate.passes(), 0, "an expired payment must not trigger its action");
-        assertEq(token.balanceOf(MERCHANT), 0);
+        vm.warp(expiry + 1);
+        _execute(10e6, calls);
         assertEq(token.balanceOf(RECOVERY), 10e6);
-        assertFalse(Payment(paymentAddress).SETTLED());
+        assertEq(token.balanceOf(MERCHANT), 0);
+        assertFalse(Payment(payment).SETTLED());
     }
 
-    function test_wrong_chain_payment_runs_no_calls() public {
-        gate.setOpen(true);
-        Payment.Call[] memory calls = _payAndPass(10e6);
-        uint64 expirationTimestamp = uint64(block.timestamp + 1 hours);
-        uint256 otherChain = block.chainid + 1;
-        address paymentAddress =
-            factory.paymentAddress(address(token), 10e6, calls, expirationTimestamp, RECOVERY, bytes32(0), otherChain);
-        token.mint(paymentAddress, 10e6);
+    function test_a_failed_call_reports_its_index_and_revert_data() public {
+        Payment.Call memory pay = _transfer(MERCHANT, 10e6);
 
-        factory.execute(address(token), 10e6, calls, expirationTimestamp, RECOVERY, bytes32(0), otherChain);
+        _fundDirect(10e6);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Payment.CallFailed.selector, 1, abi.encodeWithSelector(Reverter.Refused.selector, 42)
+            )
+        );
+        _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.customError, ()))));
 
-        assertEq(gate.passes(), 0, "a wrong-chain payment must not trigger its action");
-        assertEq(token.balanceOf(paymentAddress), 10e6);
-        assertFalse(Payment(paymentAddress).SETTLED());
+        _fundDirect(10e6);
+        vm.expectRevert(
+            abi.encodeWithSelector(Payment.CallFailed.selector, 1, abi.encodeWithSignature("Error(string)", "refused"))
+        );
+        _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.stringError, ()))));
+
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.CallFailed.selector, 1, stdError.divisionError));
+        _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.panic, (0)))));
+
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.CallFailed.selector, 1, ""));
+        _deployDirect(10e6, _list(pay, _call(address(reverter), abi.encodeCall(Reverter.empty, ()))));
     }
 
-    /// @notice Every target, every byte of calldata, and the order of the calls
-    /// are committed into the address, so no executor can alter the action.
-    function test_calls_are_committed_into_the_address() public view {
-        uint64 expirationTimestamp = uint64(block.timestamp + 1 hours);
-        Payment.Call[] memory calls = _payAndPass(10e6);
-        address committed = _address(10e6, calls, expirationTimestamp);
-
-        Payment.Call[] memory otherRecipient = _payAndPass(10e6);
-        otherRecipient[0].data = abi.encodeCall(ERC20.transfer, (PLATFORM, 10e6));
-        assertNotEq(_address(10e6, otherRecipient, expirationTimestamp), committed, "calldata is committed");
-
-        Payment.Call[] memory otherTarget = _payAndPass(10e6);
-        otherTarget[1].target = address(vault);
-        assertNotEq(_address(10e6, otherTarget, expirationTimestamp), committed, "targets are committed");
-
-        Payment.Call[] memory reordered = new Payment.Call[](2);
-        reordered[0] = calls[1];
-        reordered[1] = calls[0];
-        assertNotEq(_address(10e6, reordered, expirationTimestamp), committed, "order is committed");
-
-        Payment.Call[] memory truncated = new Payment.Call[](1);
-        truncated[0] = calls[0];
-        assertNotEq(_address(10e6, truncated, expirationTimestamp), committed, "the call count is committed");
+    /// @notice A call to an address without code succeeds and does nothing, so
+    /// an EOA, a precompile or the zero address must fail loudly instead.
+    function test_a_call_to_an_address_without_code_reverts() public {
+        address[3] memory codeless = [address(0xE0A), address(0x04), address(0)];
+        for (uint256 i; i < codeless.length; ++i) {
+            _fundDirect(10e6);
+            vm.expectRevert(abi.encodeWithSelector(Payment.CallTargetHasNoCode.selector, 1, codeless[i]));
+            _deployDirect(10e6, _list(_transfer(MERCHANT, 10e6), _call(codeless[i], "")));
+        }
     }
 
-    //---------- Helpers ----------//
-
-    function _call(address target, bytes memory data) private pure returns (Payment.Call memory) {
-        return Payment.Call({target: target, data: data});
-    }
-
-    function _pay(address to, uint256 amount) private view returns (Payment.Call[] memory calls) {
-        calls = new Payment.Call[](1);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (to, amount)));
-    }
-
-    function _payAndPass(uint256 amount) private view returns (Payment.Call[] memory calls) {
-        calls = new Payment.Call[](2);
-        calls[0] = _call(address(token), abi.encodeCall(ERC20.transfer, (MERCHANT, amount)));
-        calls[1] = _call(address(gate), abi.encodeCall(Gate.pass, ()));
-    }
-
-    function _address(uint256 amount, Payment.Call[] memory calls, uint64 expirationTimestamp)
-        private
-        view
-        returns (address)
-    {
-        return factory.paymentAddress(
-            address(token), amount, calls, expirationTimestamp, RECOVERY, bytes32(0), block.chainid
+    /// @notice Calls run inside the constructor, before the payment has code,
+    /// so a high-level call back into it reverts with no data.
+    function test_a_call_cannot_call_back_into_the_payment() public {
+        Reentrant reentrant = new Reentrant();
+        _fundDirect(10e6);
+        vm.expectRevert(abi.encodeWithSelector(Payment.CallFailed.selector, 1, ""));
+        _deployDirect(
+            10e6,
+            _list(
+                _transfer(MERCHANT, 10e6),
+                _call(address(reentrant), abi.encodeCall(Reentrant.recoverFromCaller, (address(token))))
+            )
         );
     }
 
-    function _fund(uint256 amount, Payment.Call[] memory calls, uint256 funding)
-        private
-        returns (address paymentAddress, uint64 expirationTimestamp)
-    {
-        expirationTimestamp = uint64(block.timestamp + 1 hours);
-        paymentAddress = _address(amount, calls, expirationTimestamp);
-        token.mint(paymentAddress, funding);
+    function test_a_blacklisted_recipient_reverts_the_deployment_until_cleared() public {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6));
+        address payment = _fund(10e6, calls, 10e6);
+        token.setBlacklisted(MERCHANT, true);
+
+        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        _execute(10e6, calls);
+        assertEq(token.balanceOf(payment), 10e6);
+
+        token.setBlacklisted(MERCHANT, false);
+        _execute(10e6, calls);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
     }
 
-    function _execute(uint256 amount, Payment.Call[] memory calls, uint64 expirationTimestamp) private {
-        factory.execute(address(token), amount, calls, expirationTimestamp, RECOVERY, bytes32(0), block.chainid);
+    /// @notice Too little gas for a call reverts the deployment rather than
+    /// skipping the call, so an executor cannot settle a payment without its action.
+    function test_too_little_gas_reverts_instead_of_skipping_a_call() public {
+        GasBurner burner = new GasBurner();
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(burner), abi.encodeCall(GasBurner.burn, (1_000_000))));
+        address payment = _fund(10e6, calls, 10e6);
+
+        for (uint256 gasLimit = 400_000; gasLimit <= 1_200_000; gasLimit += 100_000) {
+            try factory.execute{gas: gasLimit}(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid) {
+                revert("settled without enough gas for its action");
+            } catch {}
+            assertEq(payment.code.length, 0);
+            assertEq(token.balanceOf(payment), 10e6);
+        }
+
+        _execute(10e6, calls);
+        assertTrue(Payment(payment).SETTLED());
+    }
+
+    //---------- Events ----------//
+
+    /// @notice The full log of an overpaid, multi-call settlement: the excess
+    /// leaves first, each call is reported in order with its context, and
+    /// settlement is reported last.
+    function test_event_sequence_of_an_overpaid_multi_call_settlement() public {
+        OrderBook book = new OrderBook();
+        Payment.Call[] memory calls = _list(
+            _approve(address(vault), 10e6),
+            _call(address(vault), abi.encodeCall(ERC4626.deposit, (10e6, MERCHANT))),
+            _call(address(book), abi.encodeCall(OrderBook.markPaid, (keccak256("order-8"))))
+        );
+        address payment = _fund(10e6, calls, 13e6);
+
+        vm.recordLogs();
+        _execute(10e6, calls);
+        Vm.Log[] memory logs = _logsFrom(vm.getRecordedLogs(), payment);
+
+        assertEq(logs.length, 5);
+        assertEq(logs[0].topics[0], Recovered.selector);
+        assertEq(logs[0].topics[1], bytes32(uint256(uint160(RECOVERY))));
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(address(token)))));
+        assertEq(abi.decode(logs[0].data, (uint256)), 3e6);
+
+        bytes[3] memory results = [abi.encode(true), abi.encode(uint256(10e6)), abi.encode(true)];
+        for (uint256 i; i < 3; ++i) {
+            Vm.Log memory log = logs[1 + i];
+            assertEq(log.topics[0], Called.selector);
+            assertEq(uint256(log.topics[1]), i, "index");
+            assertEq(log.topics[2], bytes32(uint256(uint160(calls[i].target))), "target");
+            (bytes memory data, bytes memory result) = abi.decode(log.data, (bytes, bytes));
+            assertEq(data, calls[i].data, "calldata");
+            assertEq(result, results[i], "return data");
+        }
+
+        assertEq(logs[4].topics[0], Settled.selector);
+        assertEq(logs[4].topics[1], bytes32(uint256(uint160(address(token)))));
+        assertEq(abi.decode(logs[4].data, (uint256)), 10e6);
+    }
+
+    function test_a_call_with_no_return_value_reports_an_empty_result() public {
+        gate.setOpen(true);
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectEmit(true, true, true, true, payment);
+        emit Called(1, address(gate), calls[1].data, "");
+        _execute(10e6, calls);
+    }
+
+    function test_a_view_call_reports_its_result() public {
+        Payment.Call[] memory calls =
+            _list(_call(address(token), abi.encodeCall(ERC20.balanceOf, (MERCHANT))), _transfer(MERCHANT, 10e6));
+        token.mint(MERCHANT, 1e6);
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectEmit(true, true, true, true, payment);
+        emit Called(0, address(token), calls[0].data, abi.encode(uint256(1e6)));
+        _execute(10e6, calls);
+    }
+
+    //---------- Paths that run no calls ----------//
+
+    /// @notice Expiry is checked before the calls, which are neither run nor
+    /// validated: even calls that could never succeed let the refund through.
+    function test_an_expired_payment_runs_no_calls_even_invalid_ones() public {
+        gate.setOpen(true);
+        Payment.Call[] memory calls = _list(
+            _call(address(gate), abi.encodeCall(Gate.pass, ())),
+            _call(address(0xE0A), ""),
+            _call(address(reverter), abi.encodeCall(Reverter.customError, ()))
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.warp(expiry + 1);
+        vm.recordLogs();
+        _execute(10e6, calls);
+        Vm.Log[] memory logs = _logsFrom(vm.getRecordedLogs(), payment);
+
+        assertEq(gate.passes(), 0);
+        assertEq(logs.length, 1);
+        assertEq(logs[0].topics[0], Recovered.selector);
+        assertEq(token.balanceOf(RECOVERY), 10e6);
+        assertFalse(Payment(payment).SETTLED());
+    }
+
+    function test_the_expiration_boundary_still_runs_the_calls() public {
+        gate.setOpen(true);
+        Payment.Call[] memory calls =
+            _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
+        _fund(10e6, calls, 10e6);
+
+        vm.warp(expiry);
+        _execute(10e6, calls);
+        assertEq(gate.passes(), 1);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    function test_a_wrong_chain_payment_runs_no_calls_even_invalid_ones() public {
+        gate.setOpen(true);
+        Payment.Call[] memory calls =
+            _list(_call(address(gate), abi.encodeCall(Gate.pass, ())), _call(address(0xE0A), ""));
+        uint256 otherChain = block.chainid + 1;
+        address payment = factory.paymentAddress(address(token), 10e6, calls, expiry, RECOVERY, SALT, otherChain);
+        token.mint(payment, 10e6);
+
+        factory.execute(address(token), 10e6, calls, expiry, RECOVERY, SALT, otherChain);
+
+        assertEq(gate.passes(), 0);
+        assertEq(token.balanceOf(payment), 10e6);
+        assertFalse(Payment(payment).SETTLED());
+        assertEq(Payment(payment).recover(address(token)), 10e6);
+    }
+
+    /// @notice The balance check comes before the calls: an underfunded payment
+    /// reports its shortfall, not a problem with its calls.
+    function test_underfunding_is_reported_before_any_call_is_checked() public {
+        _fundDirect(10e6 - 1);
+        vm.expectRevert(abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 10e6 - 1, 10e6));
+        _deployDirect(10e6, _list(_call(address(0xE0A), "")));
+    }
+
+    //---------- After settlement ----------//
+
+    function test_late_funds_go_to_recovery_not_through_the_calls() public {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6));
+        address payment = _fund(10e6, calls, 10e6);
+        _execute(10e6, calls);
+
+        token.mint(payment, 4e6);
+        assertEq(Payment(payment).recover(address(token)), 4e6);
+        assertEq(token.balanceOf(RECOVERY), 4e6);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    /// @notice Pins why approvals in the calls should be exact: an approval the
+    /// spender does not fully use outlives settlement, and a spender that
+    /// anyone can drive can take late funds before `recover` sweeps them.
+    function test_an_unused_approval_outlives_settlement() public {
+        OpenSpender spender = new OpenSpender();
+        Payment.Call[] memory calls = _list(
+            _approve(address(spender), 15e6),
+            _call(address(spender), abi.encodeCall(OpenSpender.pull, (address(token), MERCHANT, 10e6)))
+        );
+        address payment = _fund(10e6, calls, 10e6);
+        _execute(10e6, calls);
+        assertEq(token.allowance(payment, address(spender)), 5e6, "the unused approval survives");
+
+        token.mint(payment, 5e6);
+        vm.prank(address(0xBAD));
+        spender.pullFrom(address(token), payment, address(0xBAD), 5e6);
+        assertEq(token.balanceOf(address(0xBAD)), 5e6, "late funds were taken before recovery");
+        assertEq(Payment(payment).recover(address(token)), 0);
+    }
+
+    function test_an_exact_approval_leaves_nothing_to_pull_after_settlement() public {
+        OpenSpender spender = new OpenSpender();
+        Payment.Call[] memory calls = _list(
+            _approve(address(spender), 10e6),
+            _call(address(spender), abi.encodeCall(OpenSpender.pull, (address(token), MERCHANT, 10e6)))
+        );
+        address payment = _fund(10e6, calls, 10e6);
+        _execute(10e6, calls);
+        assertEq(token.allowance(payment, address(spender)), 0);
+
+        token.mint(payment, 5e6);
+        vm.expectRevert(SafeTransferLib.TransferFromFailed.selector);
+        spender.pullFrom(address(token), payment, address(0xBAD), 5e6);
+        assertEq(Payment(payment).recover(address(token)), 5e6);
     }
 }

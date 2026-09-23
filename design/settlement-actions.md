@@ -76,7 +76,7 @@ Researched from each project's source and docs in September 2026. The items mark
 
 What we take from the table:
 
-1. **Nobody else calls from a per-payment address.** Every competitor's target sees a *shared* executor, so targets cannot authenticate who paid. Ours see the single-use payment address. A target that wants to can check it with `factory.paymentAddress(...)`, since the address commits to the calldata the target receives.
+1. **Nobody else calls from a per-payment address.** Every competitor's target sees a *shared* executor, so targets cannot authenticate who paid. Ours see the single-use payment address. A target that wants to can authenticate it: it takes the other terms and the preceding calls as arguments, appends its own call (`msg.data`), and checks that `factory.paymentAddress(...)` equals `msg.sender`. There is no circularity, because a call's calldata never needs to contain itself. `AuthenticatedOrderBook` in `test/utils/SettlementFixtures.sol` does this.
 2. **Handing funds over is part of the call list.** Approve then call and transfer then call are both just calls here. deBridge's exact-approve-and-revoke discipline becomes an offchain rule about exact approvals, which works because `Payment` is single-use.
 3. **Every design that isn't all-or-nothing needs a gas guard.** deBridge and LI.FI's Stargate receiver have one; Squid, Bungee and Daimo don't, and Circle calls it out explicitly. Our revert-only rule sidesteps this.
 4. **The failure policy splits the field.**

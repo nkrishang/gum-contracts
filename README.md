@@ -88,7 +88,7 @@ The calls are how a payment triggers onchain actions. A plain payment is a singl
 Rules the calls must follow:
 
 - **Every target and every byte of calldata is committed into the address.** Anyone can therefore verify what a payment will do offchain, before paying, by recomputing the address. The contracts enforce no allowlist, and the chosen calls are exactly what runs.
-- **Calls run as the payment address, inside its constructor.** The payment has no code yet, so a target that calls back into it, such as a swap callback or a flash-loan callback, fails. Targets should not care who calls them. A target that must know it was paid should pull the tokens with `transferFrom` rather than trust `msg.sender`.
+- **Calls run as the payment address, inside its constructor.** The payment has no code yet, so a target that calls back into it, such as a swap callback or a flash-loan callback, fails. Targets should not care who calls them. A target that must know it was paid should pull the tokens with `transferFrom` rather than trust `msg.sender`. Alternatively, it can take the payment's terms as arguments and check that the factory derives `msg.sender` from them; `AuthenticatedOrderBook` in [`test/utils/SettlementFixtures.sol`](test/utils/SettlementFixtures.sol) shows how.
 - **The calls must spend exactly `amount`.** The excess has already gone to `recovery` when they run, so they cannot spend more. Leaving any of it unspent reverts with `AmountNotSpent`. A call to an address with no code reverts with `CallTargetHasNoCode`, because it would otherwise succeed and do nothing.
 - **Approvals should be exact.** An approval the target doesn't fully use outlives the constructor, and would let that spender pull late funds before `recover` sweeps them. Check this offchain along with the rest of the calls.
 - **Calls carry no native value**, and expired or wrong-chain payments never run their calls.
@@ -145,13 +145,13 @@ The default run is fully offline. Fork tests are skipped unless you opt in:
 GUM_FORK_TESTS=1 forge test
 ```
 
-Fork tests exercise the forwarder against the live USDC and CCTP V2 contracts, and verify that USDT0 accepts the EIP-3009 authorizations and EIP-712 domain the backend reconstructs. Each chain uses a public RPC by default, which you can override:
+Fork tests exercise the forwarder and settlement calls (plain transfers, fee splits, CCTP V2 burns, blacklisted recipients) against the live USDC, USDT0 and CCTP V2 contracts, and verify that USDT0 accepts the EIP-3009 authorizations and EIP-712 domain the backend reconstructs. Each chain uses a public RPC by default, which you can override:
 
 | Chain | Chain ID | RPC override | Covers |
 | --- | --- | --- | --- |
-| Monad | `143` | `GUM_FORK_RPC_URL_143` | USDC + CCTP, USDT0 |
-| Base | `8453` | `GUM_FORK_RPC_URL_8453` | USDC + CCTP |
-| Arbitrum | `42161` | `GUM_FORK_RPC_URL_42161` | USDC + CCTP, USDT0 |
+| Monad | `143` | `GUM_FORK_RPC_URL_143` | USDC + CCTP, USDT0, settlement calls |
+| Base | `8453` | `GUM_FORK_RPC_URL_8453` | USDC + CCTP, settlement calls |
+| Arbitrum | `42161` | `GUM_FORK_RPC_URL_42161` | USDC + CCTP, USDT0, settlement calls |
 
 CI runs `forge fmt --check`, `forge build --sizes` and `forge test -vvv` on every push and pull request.
 

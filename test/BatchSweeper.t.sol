@@ -10,6 +10,8 @@ import {BatchSweeper} from "src/BatchSweeper.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
+import {ERC4626} from "lib/solady/src/tokens/ERC4626.sol";
+import {Gate, MockVault} from "test/utils/SettlementFixtures.sol";
 
 contract BatchSweeperTest is Test {
     event SweepFailed(address indexed paymentAddress, address indexed token, bytes revertData);
@@ -238,6 +240,99 @@ contract BatchSweeperTest is Test {
 
         batchSweeper.executeBatch(sweeps);
         assertEq(token.balanceOf(address(0xCAFE)), 10e6, "the rescue returns the balance to the payer's wallet");
+    }
+
+    //---------- Settlement calls ----------//
+
+    /// @notice An item whose action fails is reported and keeps its funds; its
+    /// siblings settle, and a later batch settles it once the target recovers.
+    function test_item_whose_call_fails_is_reported_and_settles_in_a_later_batch() public {
+        Gate gate = new Gate();
+        Payment.Call[] memory gated = new Payment.Call[](2);
+        gated[0] = _transferCall(address(0xD1), 10e6);
+        gated[1] = Payment.Call({target: address(gate), data: abi.encodeCall(Gate.pass, ())});
+        BatchSweeper.Sweep[] memory sweeps = new BatchSweeper.Sweep[](2);
+        sweeps[0] = _sweepWith(10e6, gated, bytes32(uint256(1)));
+        sweeps[1] = _sweep(20e6, address(0xD2), bytes32(uint256(2)));
+        address gatedPayment = _paymentAddress(sweeps[0]);
+        token.mint(gatedPayment, 11e6);
+        token.mint(_paymentAddress(sweeps[1]), 20e6);
+
+        vm.expectEmit(true, true, false, true, address(batchSweeper));
+        emit SweepFailed(gatedPayment, address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector));
+        batchSweeper.executeBatch(sweeps);
+
+        assertEq(gatedPayment.code.length, 0);
+        assertEq(token.balanceOf(gatedPayment), 11e6, "the failed item keeps its whole balance");
+        assertEq(token.balanceOf(address(0xD1)), 0);
+        assertEq(token.balanceOf(address(0xD2)), 20e6, "the sibling settles");
+
+        gate.setOpen(true);
+        batchSweeper.executeBatch(sweeps);
+        assertEq(gate.passes(), 1);
+        assertEq(token.balanceOf(address(0xD1)), 10e6);
+        assertEq(token.balanceOf(address(0xCAFE)), 1e6);
+    }
+
+    function test_multi_call_items_settle_in_one_batch() public {
+        MockVault vault = new MockVault(address(token));
+        Payment.Call[] memory deposit = new Payment.Call[](2);
+        deposit[0] = Payment.Call({target: address(token), data: abi.encodeCall(ERC20.approve, (address(vault), 10e6))});
+        deposit[1] =
+            Payment.Call({target: address(vault), data: abi.encodeCall(ERC4626.deposit, (10e6, address(0xD3)))});
+        Payment.Call[] memory split = new Payment.Call[](2);
+        split[0] = _transferCall(address(0xD4), 19e6);
+        split[1] = _transferCall(address(0xD5), 1e6);
+        BatchSweeper.Sweep[] memory sweeps = new BatchSweeper.Sweep[](2);
+        sweeps[0] = _sweepWith(10e6, deposit, bytes32(uint256(1)));
+        sweeps[1] = _sweepWith(20e6, split, bytes32(uint256(2)));
+        token.mint(_paymentAddress(sweeps[0]), 10e6);
+        token.mint(_paymentAddress(sweeps[1]), 20e6);
+
+        vm.recordLogs();
+        batchSweeper.executeBatch(sweeps);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != SweepFailed.selector, "no item may fail");
+        }
+
+        assertEq(vault.balanceOf(address(0xD3)), 10e6);
+        assertEq(token.balanceOf(address(0xD4)), 19e6);
+        assertEq(token.balanceOf(address(0xD5)), 1e6);
+    }
+
+    /// @notice Two items with identical calls but different salts are distinct
+    /// payments: each settles from its own balance.
+    function test_items_with_identical_calls_settle_independently() public {
+        BatchSweeper.Sweep[] memory sweeps = new BatchSweeper.Sweep[](2);
+        sweeps[0] = _sweep(10e6, address(0xD6), bytes32(uint256(1)));
+        sweeps[1] = _sweep(10e6, address(0xD6), bytes32(uint256(2)));
+        assertNotEq(_paymentAddress(sweeps[0]), _paymentAddress(sweeps[1]));
+        token.mint(_paymentAddress(sweeps[0]), 10e6);
+
+        vm.expectEmit(true, true, false, true, address(batchSweeper));
+        emit SweepFailed(
+            _paymentAddress(sweeps[1]), address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector)
+        );
+        batchSweeper.executeBatch(sweeps);
+        assertEq(token.balanceOf(address(0xD6)), 10e6, "only the funded item paid");
+
+        token.mint(_paymentAddress(sweeps[1]), 10e6);
+        batchSweeper.executeBatch(sweeps);
+        assertEq(token.balanceOf(address(0xD6)), 20e6);
+    }
+
+    function _transferCall(address to, uint256 amount) private view returns (Payment.Call memory) {
+        return Payment.Call({target: address(token), data: abi.encodeCall(ERC20.transfer, (to, amount))});
+    }
+
+    function _sweepWith(uint256 amount, Payment.Call[] memory calls, bytes32 salt)
+        private
+        view
+        returns (BatchSweeper.Sweep memory sweep)
+    {
+        sweep = _sweep(amount, address(0), salt);
+        sweep.calls = calls;
     }
 
     function _execute(BatchSweeper.Sweep memory sweep) private {
