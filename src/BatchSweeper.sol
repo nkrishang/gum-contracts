@@ -12,7 +12,7 @@ contract BatchSweeper {
     struct Sweep {
         address token;
         uint256 amount;
-        address receiver;
+        Payment.Call[] calls;
         uint64 expirationTimestamp;
         address recovery;
         bytes32 salt;
@@ -38,7 +38,7 @@ contract BatchSweeper {
             address paymentAddress = FACTORY.paymentAddress(
                 sweep.token,
                 sweep.amount,
-                sweep.receiver,
+                sweep.calls,
                 sweep.expirationTimestamp,
                 sweep.recovery,
                 sweep.salt,
@@ -56,7 +56,7 @@ contract BatchSweeper {
             try FACTORY.execute(
                 sweep.token,
                 sweep.amount,
-                sweep.receiver,
+                sweep.calls,
                 sweep.expirationTimestamp,
                 sweep.recovery,
                 sweep.salt,

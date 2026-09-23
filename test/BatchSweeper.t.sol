@@ -3,6 +3,7 @@ pragma solidity ^0.8.13;
 
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
+import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 import {BatchSweeper} from "src/BatchSweeper.sol";
@@ -241,21 +242,17 @@ contract BatchSweeperTest is Test {
 
     function _execute(BatchSweeper.Sweep memory sweep) private {
         factory.execute(
-            sweep.token,
-            sweep.amount,
-            sweep.receiver,
-            sweep.expirationTimestamp,
-            sweep.recovery,
-            sweep.salt,
-            sweep.chainId
+            sweep.token, sweep.amount, sweep.calls, sweep.expirationTimestamp, sweep.recovery, sweep.salt, sweep.chainId
         );
     }
 
     function _sweep(uint256 amount, address receiver, bytes32 salt) private view returns (BatchSweeper.Sweep memory) {
+        Payment.Call[] memory calls = new Payment.Call[](1);
+        calls[0] = Payment.Call({target: address(token), data: abi.encodeCall(ERC20.transfer, (receiver, amount))});
         return BatchSweeper.Sweep({
             token: address(token),
             amount: amount,
-            receiver: receiver,
+            calls: calls,
             expirationTimestamp: uint64(block.timestamp + 1 days),
             recovery: address(0xCAFE),
             salt: salt,
@@ -265,13 +262,7 @@ contract BatchSweeperTest is Test {
 
     function _paymentAddress(BatchSweeper.Sweep memory sweep) private view returns (address) {
         return factory.paymentAddress(
-            sweep.token,
-            sweep.amount,
-            sweep.receiver,
-            sweep.expirationTimestamp,
-            sweep.recovery,
-            sweep.salt,
-            sweep.chainId
+            sweep.token, sweep.amount, sweep.calls, sweep.expirationTimestamp, sweep.recovery, sweep.salt, sweep.chainId
         );
     }
 }
