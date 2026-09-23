@@ -4,7 +4,6 @@ pragma solidity ^0.8.13;
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
-import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 import {BatchSweeper} from "src/BatchSweeper.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
@@ -45,7 +44,9 @@ contract BatchSweeperTest is Test {
         token.mint(third, 30e6);
 
         vm.expectEmit(true, true, false, true, address(batchSweeper));
-        emit SweepFailed(failed, address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector));
+        emit SweepFailed(
+            failed, address(token), abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 20e6 - 1, 20e6)
+        );
         batchSweeper.executeBatch(sweeps);
 
         assertGt(first.code.length, 0);
@@ -73,7 +74,7 @@ contract BatchSweeperTest is Test {
         token.setBlacklisted(address(0xCAFE), true);
 
         vm.expectEmit(true, true, false, true, address(batchSweeper));
-        emit SweepFailed(overpaid, address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector));
+        emit SweepFailed(overpaid, address(token), abi.encodeWithSelector(SafeTransferLib.TransferFailed.selector));
         batchSweeper.executeBatch(sweeps);
 
         assertEq(overpaid.code.length, 0);
@@ -128,11 +129,15 @@ contract BatchSweeperTest is Test {
         token.setPaused(true);
         vm.expectEmit(true, true, false, true, address(batchSweeper));
         emit SweepFailed(
-            _paymentAddress(sweeps[0]), address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector)
+            _paymentAddress(sweeps[0]),
+            address(token),
+            _callFailed(0, abi.encodeWithSignature("Error(string)", "Pausable: paused"))
         );
         vm.expectEmit(true, true, false, true, address(batchSweeper));
         emit SweepFailed(
-            _paymentAddress(sweeps[1]), address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector)
+            _paymentAddress(sweeps[1]),
+            address(token),
+            _callFailed(0, abi.encodeWithSignature("Error(string)", "Pausable: paused"))
         );
         batchSweeper.executeBatch(sweeps);
         assertEq(_paymentAddress(sweeps[0]).code.length, 0, "a paused token must leave no deployment behind");
@@ -187,7 +192,9 @@ contract BatchSweeperTest is Test {
 
         vm.expectEmit(true, true, false, true, address(batchSweeper));
         emit SweepFailed(
-            _paymentAddress(sweeps[1]), address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector)
+            _paymentAddress(sweeps[1]),
+            address(token),
+            _callFailed(0, abi.encodeWithSignature("Error(string)", "Blacklistable: account is blacklisted"))
         );
         batchSweeper.executeBatch(sweeps);
 
@@ -259,7 +266,9 @@ contract BatchSweeperTest is Test {
         token.mint(_paymentAddress(sweeps[1]), 20e6);
 
         vm.expectEmit(true, true, false, true, address(batchSweeper));
-        emit SweepFailed(gatedPayment, address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector));
+        emit SweepFailed(
+            gatedPayment, address(token), _callFailed(1, abi.encodeWithSignature("Error(string)", "closed"))
+        );
         batchSweeper.executeBatch(sweeps);
 
         assertEq(gatedPayment.code.length, 0);
@@ -312,7 +321,9 @@ contract BatchSweeperTest is Test {
 
         vm.expectEmit(true, true, false, true, address(batchSweeper));
         emit SweepFailed(
-            _paymentAddress(sweeps[1]), address(token), abi.encodeWithSelector(CREATE3.DeploymentFailed.selector)
+            _paymentAddress(sweeps[1]),
+            address(token),
+            abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 0, 10e6)
         );
         batchSweeper.executeBatch(sweeps);
         assertEq(token.balanceOf(address(0xD6)), 10e6, "only the funded item paid");
@@ -359,5 +370,9 @@ contract BatchSweeperTest is Test {
         return factory.paymentAddress(
             sweep.token, sweep.amount, sweep.calls, sweep.expirationTimestamp, sweep.recovery, sweep.salt, sweep.chainId
         );
+    }
+
+    function _callFailed(uint256 index, bytes memory revertData) private pure returns (bytes memory) {
+        return abi.encodeWithSelector(Payment.CallFailed.selector, index, revertData);
     }
 }

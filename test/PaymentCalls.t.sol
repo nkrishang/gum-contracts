@@ -3,7 +3,6 @@ pragma solidity ^0.8.13;
 
 import {Vm} from "lib/forge-std/src/Vm.sol";
 import {stdError} from "lib/forge-std/src/StdError.sol";
-import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {ERC4626} from "lib/solady/src/tokens/ERC4626.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
@@ -11,6 +10,7 @@ import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
 import {ITokenMessengerV2} from "src/WithdrawalForwarder.sol";
+import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 import {MockTokenMessenger} from "test/WithdrawalForwarder.t.sol";
 import {
     AuthenticatedOrderBook,
@@ -48,7 +48,7 @@ contract PaymentCallsTest is PaymentCallsBase {
     function test_address_derivation_matches_the_documented_formula() public view {
         Payment.Call[] memory calls = _list(_approve(address(vault), 10e6), _call(address(vault), hex"c0ffee"));
         bytes32 salt = keccak256(abi.encode(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid));
-        assertEq(_address(10e6, calls), CREATE3.predictDeterministicAddress(salt, address(factory)));
+        assertEq(_address(10e6, calls), BubblingCREATE3.predictDeterministicAddress(salt, address(factory)));
     }
 
     /// @notice A fixed vector for other implementations of the derivation,
@@ -83,7 +83,7 @@ contract PaymentCallsTest is PaymentCallsBase {
                 bytes32(uint256(7)),
                 8453
             ),
-            CREATE3.predictDeterministicAddress(salt, address(factory)),
+            BubblingCREATE3.predictDeterministicAddress(salt, address(factory)),
             "the factory uses exactly this salt"
         );
     }
@@ -111,7 +111,7 @@ contract PaymentCallsTest is PaymentCallsBase {
         address payment = _fund(10e6, calls, 10e6);
         Payment.Call[] memory redirected = _list(_transfer(address(0xBAD), 10e6));
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 0, 10e6));
         _execute(10e6, redirected);
         assertEq(token.balanceOf(payment), 10e6);
         assertEq(payment.code.length, 0);
@@ -278,7 +278,7 @@ contract PaymentCallsTest is PaymentCallsBase {
         );
         address payment = _fund(10e6, calls, 10e6);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(_callFailed(1, abi.encodeWithSignature("Error(string)", "does not pay the merchant")));
         _execute(10e6, calls);
         assertEq(token.balanceOf(payment), 10e6);
     }
@@ -405,7 +405,7 @@ contract PaymentCallsTest is PaymentCallsBase {
             _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
         address payment = _fund(10e6, calls, 12e6);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(_callFailed(1, abi.encodeWithSignature("Error(string)", "closed")));
         _execute(10e6, calls);
         assertEq(payment.code.length, 0);
         assertEq(token.balanceOf(payment), 12e6, "the earlier transfer and the excess roll back");
@@ -426,7 +426,7 @@ contract PaymentCallsTest is PaymentCallsBase {
             _list(_transfer(MERCHANT, 10e6), _call(address(gate), abi.encodeCall(Gate.pass, ())));
         address payment = _fund(10e6, calls, 10e6);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(_callFailed(1, abi.encodeWithSignature("Error(string)", "closed")));
         _execute(10e6, calls);
 
         vm.warp(expiry + 1);
@@ -497,7 +497,9 @@ contract PaymentCallsTest is PaymentCallsBase {
         address payment = _fund(10e6, calls, 10e6);
         token.setBlacklisted(MERCHANT, true);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(
+            _callFailed(0, abi.encodeWithSignature("Error(string)", "Blacklistable: account is blacklisted"))
+        );
         _execute(10e6, calls);
         assertEq(token.balanceOf(payment), 10e6);
 

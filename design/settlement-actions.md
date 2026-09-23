@@ -53,7 +53,7 @@ What the constructor does:
 
 - The payment has no code while its calls run, so targets must not call back into it. Raw Uniswap pool swaps and flash loans are therefore out; routers that pull via `transferFrom` are fine.
 - Approve exactly what the next call pulls.
-- `execute` still surfaces every constructor failure as `CREATE3.DeploymentFailed`. Simulate the constructor, or `new Payment(...)` in an `eth_call`, to get the inner error.
+- `execute` reverts with the constructor's own error: it deploys through `BubblingCREATE3`, whose proxy reverts with the revert data of its failed `CREATE` (Solady's proxy discards it). An executed payment reverts `AlreadyDeployed()`, and `DeploymentFailed()` is left for reverts without data. The proxy change moves every address, so offchain derivation must use `BubblingCREATE3.PROXY_INITCODE_HASH`.
 - Calls are part of a payment's identity. The backend must store the full call list to derive the address and to execute it.
 - An action that fails permanently (sold out, bad calldata) keeps the funds at the address until expiry, and then refunds them to `recovery`. So simulate calls when quoting a payment, and exclude failing items from sweep batches.
 - A heavy call list uses its share of the batch's gas. Give such items their own batches, or cap the gas per item.

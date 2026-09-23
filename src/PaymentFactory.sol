@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
+import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 import {Payment} from "src/Payment.sol";
 
 /// @notice Ownerless CREATE3 deployer for `Payment`.
@@ -11,7 +11,10 @@ import {Payment} from "src/Payment.sol";
 /// address fixes the routing of funds.
 ///
 /// Execution is permissionless; the deployed `Payment` reports the outcome through
-/// its `Called`/`Settled`/`Recovered` events and `SETTLED` state variable.
+/// its `Called`/`Settled`/`Recovered` events and `SETTLED` state variable. When
+/// the `Payment` constructor reverts, `execute` reverts with the same revert data,
+/// and it reverts with `BubblingCREATE3.AlreadyDeployed` once the payment has
+/// been executed.
 ///
 /// The factory is deployed at the same address on every supported chain, so
 /// the same arguments generate the same address for `Payment` everywhere.
@@ -26,8 +29,8 @@ contract PaymentFactory {
         bytes32 salt,
         uint256 chainId
     ) external view returns (address payable) {
-        return payable(CREATE3.predictDeterministicAddress(
-                deploymentSalt(token, amount, calls, expirationTimestamp, recovery, salt, chainId)
+        return payable(BubblingCREATE3.predictDeterministicAddress(
+                deploymentSalt(token, amount, calls, expirationTimestamp, recovery, salt, chainId), address(this)
             ));
     }
 
@@ -41,7 +44,7 @@ contract PaymentFactory {
         bytes32 salt,
         uint256 chainId
     ) external {
-        CREATE3.deployDeterministic({
+        BubblingCREATE3.deployDeterministic({
             salt: deploymentSalt(token, amount, calls, expirationTimestamp, recovery, salt, chainId),
             initCode: abi.encodePacked(
                 type(Payment).creationCode, abi.encode(token, amount, calls, expirationTimestamp, recovery, chainId)

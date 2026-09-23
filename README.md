@@ -48,6 +48,14 @@ A payment is described by seven parameters:
 
 `PaymentFactory` hashes all seven into a CREATE3 salt, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given.
 
+The factory deploys through [`BubblingCREATE3`](src/utils/BubblingCREATE3.sol), whose proxy differs from Solady's so that constructor reverts reach the caller. To derive an address offchain, use the proxy's init code hash `0xc57c9b86f6f9162380bc9ddd7e90e8a4a1bab25d7dc6981dc9bf0d85f3490ef9`, not Solady's:
+
+```
+salt    = keccak256(abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId))
+proxy   = keccak256(0xff ++ factory ++ salt ++ 0xc57c9b86…0ef9)[12:]
+payment = keccak256(0xd694 ++ proxy ++ 0x01)[12:]
+```
+
 ```
 1. Quote     factory.paymentAddress(...)  ->  counterfactual address, no code yet
 2. Pay       payer sends tokens to that address with an ordinary ERC-20 transfer
@@ -69,7 +77,7 @@ After deployment, `recover(token)` is a permissionless call that forwards the co
 
 Things worth knowing when integrating:
 
-- `execute` surfaces constructor failures as Solady's `CREATE3.DeploymentFailed`, not the inner error. Both an underfunded payment and an already-executed payment revert this way; tell them apart by checking whether the address has code. [`test/ExecuteRevert.t.sol`](test/ExecuteRevert.t.sol) pins this behaviour.
+- `execute` reverts with the `Payment` constructor's own revert data, e.g. `InsufficientTokenBalance(balance, required)`, `CallFailed(index, revertData)`, `AmountNotSpent(remaining)` or a token's transfer error, so decode it against the `Payment` ABI. It reverts with `AlreadyDeployed()` once the payment has executed, and with `DeploymentFailed()` only when the constructor reverted without data, e.g. out of gas. `BatchSweeper` reports the same data in `SweepFailed`. [`test/ExecuteRevert.t.sol`](test/ExecuteRevert.t.sol) pins this behaviour.
 - Settlement is atomic. If the excess can't be delivered to `recovery` (for example, a blacklisted address), or any call fails, the whole deployment reverts and nothing is paid.
 - The expiry boundary is inclusive: a payment executed at exactly `expirationTimestamp` still settles.
 - The factory must live at the same address on every supported chain so that the same terms produce the same payment address everywhere. That is what makes funds sent on the wrong chain recoverable.
@@ -202,6 +210,7 @@ GUM_CHAIN_ID=<chain-id> forge script script/Bootstrap.s.sol:BootstrapScript \
 src/
   Payment.sol               Self-settling payment contract with committed calls
   PaymentFactory.sol        CREATE3 factory and address derivation
+  utils/BubblingCREATE3.sol CREATE3 that bubbles up constructor reverts
   BatchSweeper.sol          Batched execute / recover
   WithdrawalForwarder.sol   EIP-3009 + CCTP V2 withdrawal bridge
   mock/MockStablecoin.sol   FiatToken-like fixture for tests and Anvil

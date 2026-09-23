@@ -3,7 +3,6 @@ pragma solidity ^0.8.13;
 
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
-import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
@@ -156,7 +155,13 @@ abstract contract UsdcPaymentCallsForkTest is PaymentCallsForkBase {
 
         vm.prank(blacklister);
         IFiatTokenAdmin(stablecoin).blacklist(MERCHANT);
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Payment.CallFailed.selector,
+                0,
+                abi.encodeWithSignature("Error(string)", "Blacklistable: account is blacklisted")
+            )
+        );
         _execute(calls);
         assertEq(ERC20(stablecoin).balanceOf(payment), AMOUNT);
         assertEq(payment.code.length, 0);

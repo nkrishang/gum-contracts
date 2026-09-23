@@ -3,7 +3,8 @@ pragma solidity ^0.8.13;
 
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
-import {CREATE3} from "lib/solady/src/utils/CREATE3.sol";
+import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
+import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
@@ -100,7 +101,7 @@ contract PaymentTest is Test {
         (address paymentAddress, uint64 expirationTimestamp, bytes32 salt) = _invoice(10e6, 4);
         token.mint(paymentAddress, 10e6 - 1);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 10e6 - 1, 10e6));
         factory.execute(address(token), 10e6, _pay(RECEIVER, 10e6), expirationTimestamp, RECOVERY, salt, block.chainid);
 
         assertEq(paymentAddress.code.length, 0, "a failed deployment must leave the address usable for the invoice");
@@ -109,8 +110,8 @@ contract PaymentTest is Test {
         assertEq(token.balanceOf(RECOVERY), 0);
     }
 
-    /// @notice CREATE3 discards constructor revert data, so deploy directly to
-    /// pin the custom error and the balances it reports.
+    /// @notice The same failure without the factory: the constructor's own error
+    /// and the balances it reports.
     function test_underfunded_deployment_reverts_with_insufficient_token_balance() public {
         uint64 expirationTimestamp = uint64(block.timestamp + 1 hours);
         PaymentDeployer deployer = new PaymentDeployer();
@@ -151,7 +152,7 @@ contract PaymentTest is Test {
         token.mint(paymentAddress, 12e6);
         token.setBlacklisted(RECOVERY, true);
 
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(SafeTransferLib.TransferFailed.selector);
         factory.execute(address(token), 10e6, _pay(RECEIVER, 10e6), expirationTimestamp, RECOVERY, salt, block.chainid);
 
         assertEq(token.balanceOf(RECEIVER), 0, "the receiver leg must roll back with the recovery leg");
@@ -260,7 +261,7 @@ contract PaymentTest is Test {
         assertEq(token.balanceOf(RECOVERY), 4e6);
 
         token.mint(paymentAddress, 6e6);
-        vm.expectRevert(CREATE3.DeploymentFailed.selector);
+        vm.expectRevert(BubblingCREATE3.AlreadyDeployed.selector);
         factory.execute(address(token), 10e6, _pay(RECEIVER, 10e6), expirationTimestamp, RECOVERY, salt, block.chainid);
 
         assertEq(Payment(paymentAddress).recover(address(token)), 6e6);

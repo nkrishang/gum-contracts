@@ -22,6 +22,7 @@ contract BatchSweeper {
     //---------- Events ----------//
 
     /// @notice Emitted on failure of `factory.execute` (fresh deployment) or `Payment.recover`.
+    /// For a deployment, `revertData` is the `Payment` constructor's own error.
     event SweepFailed(address indexed paymentAddress, address indexed token, bytes revertData);
 
     //---------- Storage ----------//
