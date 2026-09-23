@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.24;
 
 import {Vm} from "lib/forge-std/src/Vm.sol";
 import {stdError} from "lib/forge-std/src/StdError.sol";
@@ -10,7 +10,6 @@ import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
 import {ITokenMessengerV2} from "src/WithdrawalForwarder.sol";
-import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 import {MockTokenMessenger} from "test/WithdrawalForwarder.t.sol";
 import {
     AuthenticatedOrderBook,
@@ -23,6 +22,7 @@ import {
     OpenSpender,
     OrderBook,
     PaymentCallsBase,
+    RawReturner,
     Reentrant,
     Reverter
 } from "test/utils/SettlementFixtures.sol";
@@ -43,49 +43,28 @@ contract PaymentCallsTest is PaymentCallsBase {
 
     //---------- Commitment ----------//
 
-    /// @notice The address is the documented hash of the terms, so gum-server
-    /// can derive it without calling the factory.
+    /// @notice The address follows the documented derivation, so gum-server
+    /// can compute it without calling the factory.
     function test_address_derivation_matches_the_documented_formula() public view {
         Payment.Call[] memory calls = _list(_approve(address(vault), 10e6), _call(address(vault), hex"c0ffee"));
-        bytes32 salt = keccak256(abi.encode(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid));
-        assertEq(_address(10e6, calls), BubblingCREATE3.predictDeterministicAddress(salt, address(factory)));
+        bytes memory terms = abi.encode(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid);
+        assertEq(_address(10e6, calls), _create2Address(terms));
     }
 
-    /// @notice A fixed vector for other implementations of the derivation,
-    /// cross-checked with `cast abi-encode` + `cast keccak`. The CREATE3 salt
-    /// depends only on the terms; the address then depends on the factory.
-    function test_deployment_salt_vector() public view {
-        Payment.Call[] memory calls = new Payment.Call[](2);
-        calls[0] = Payment.Call({
-            target: 0x1111111111111111111111111111111111111111,
-            data: abi.encodeWithSignature("transfer(address,uint256)", address(0xBEEF), uint256(10e6))
-        });
-        calls[1] = Payment.Call({target: 0x2222222222222222222222222222222222222222, data: hex"01"});
-        bytes32 salt = keccak256(
-            abi.encode(
-                0x1111111111111111111111111111111111111111,
-                uint256(10e6),
-                calls,
-                uint64(1_700_000_000),
-                address(0xCAFE),
-                bytes32(uint256(7)),
-                uint256(8453)
-            )
+    /// @notice `terms` is exactly the calldata arguments of `execute` and
+    /// `paymentAddress`, which is what lets the factory copy them into the
+    /// init code verbatim.
+    function test_terms_are_the_calldata_arguments() public view {
+        Payment.Call[] memory calls = _list(_transfer(MERCHANT, 10e6), _call(address(gate), hex"01"));
+        bytes memory terms = abi.encode(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid);
+        bytes memory executeCall = abi.encodeCall(
+            PaymentFactory.execute, (address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid)
         );
-        assertEq(salt, 0x3ef67ee909666dc854602dc4af5e8bf318c0737e8653d1659d0b51259f339799, "salt vector");
-        assertEq(
-            factory.paymentAddress(
-                0x1111111111111111111111111111111111111111,
-                10e6,
-                calls,
-                1_700_000_000,
-                address(0xCAFE),
-                bytes32(uint256(7)),
-                8453
-            ),
-            BubblingCREATE3.predictDeterministicAddress(salt, address(factory)),
-            "the factory uses exactly this salt"
+        bytes memory addressCall = abi.encodeCall(
+            PaymentFactory.paymentAddress, (address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid)
         );
+        assertEq(bytes.concat(bytes4(PaymentFactory.execute.selector), terms), executeCall);
+        assertEq(bytes.concat(bytes4(PaymentFactory.paymentAddress.selector), terms), addressCall);
     }
 
     /// @notice Every target, every byte of calldata, their order and their count
@@ -516,7 +495,8 @@ contract PaymentCallsTest is PaymentCallsBase {
             _list(_transfer(MERCHANT, 10e6), _call(address(burner), abi.encodeCall(GasBurner.burn, (1_000_000))));
         address payment = _fund(10e6, calls, 10e6);
 
-        for (uint256 gasLimit = 400_000; gasLimit <= 1_200_000; gasLimit += 100_000) {
+        // The action alone needs 1M gas, so no limit up to that can settle it.
+        for (uint256 gasLimit = 400_000; gasLimit <= 1_000_000; gasLimit += 100_000) {
             try factory.execute{gas: gasLimit}(address(token), 10e6, calls, expiry, RECOVERY, SALT, block.chainid) {
                 revert("settled without enough gas for its action");
             } catch {}
@@ -566,6 +546,36 @@ contract PaymentCallsTest is PaymentCallsBase {
         assertEq(logs[4].topics[0], Settled.selector);
         assertEq(logs[4].topics[1], bytes32(uint256(uint160(address(token)))));
         assertEq(abi.decode(logs[4].data, (uint256)), 10e6);
+    }
+
+    /// @notice The event data is the exact canonical ABI encoding, padding
+    /// included, even when a call's calldata or return data is shorter and of
+    /// odd length after a longer one: nothing of an earlier call leaks through.
+    function test_called_event_data_is_canonically_encoded() public {
+        RawReturner returner = new RawReturner();
+        bytes memory long = new bytes(70);
+        for (uint256 i; i < long.length; ++i) {
+            long[i] = 0xff;
+        }
+        Payment.Call[] memory calls = new Payment.Call[](4);
+        // Same calldata length, shorter result: the result padding lands on call 0's result.
+        calls[0] = _call(address(returner), abi.encodeCall(RawReturner.echo, (long, 70)));
+        calls[1] = _call(address(returner), abi.encodeCall(RawReturner.echo, (long, 1)));
+        // Shorter calldata: the calldata padding lands on call 1's calldata.
+        calls[2] = _call(address(returner), abi.encodeCall(RawReturner.echo, (hex"01", 1)));
+        calls[3] = _transfer(MERCHANT, 10e6);
+        bytes[4] memory results = [long, bytes(hex"ff"), bytes(hex"01"), abi.encode(true)];
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.recordLogs();
+        _execute(10e6, calls);
+        Vm.Log[] memory logs = _logsFrom(vm.getRecordedLogs(), payment);
+
+        assertEq(logs.length, 5);
+        for (uint256 i; i < 4; ++i) {
+            assertEq(logs[i].topics[0], Called.selector);
+            assertEq(logs[i].data, abi.encode(calls[i].data, results[i]), "exact bytes, padding included");
+        }
     }
 
     function test_a_call_with_no_return_value_reports_an_empty_result() public {
@@ -702,5 +712,15 @@ contract PaymentCallsTest is PaymentCallsBase {
 
     function _callFailed(uint256 index, bytes memory revertData) private pure returns (bytes memory) {
         return abi.encodeWithSelector(Payment.CallFailed.selector, index, revertData);
+    }
+
+    /// @dev The documented derivation: CREATE2 with a zero salt of `Payment`'s
+    /// creation code followed by its constructor arguments.
+    function _create2Address(bytes memory terms) private view returns (address) {
+        bytes memory initCode =
+            abi.encodePacked(type(Payment).creationCode, abi.encode(factory.paymentImplementation(), terms));
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(hex"ff", address(factory), bytes32(0), keccak256(initCode)))))
+        );
     }
 }

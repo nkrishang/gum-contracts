@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.24;
 
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
@@ -108,6 +108,16 @@ contract AuthenticatedOrderBook {
     }
 }
 
+/// @dev Returns the first `length` bytes of its argument as raw return data.
+contract RawReturner {
+    function echo(bytes calldata raw, uint256 length) external pure {
+        assembly {
+            calldatacopy(0, raw.offset, length)
+            return(0, length)
+        }
+    }
+}
+
 /// @dev Stands in for a target that is temporarily unable to accept a call.
 contract Gate {
     bool public open;
@@ -206,9 +216,11 @@ contract FalseReturningToken is ERC20 {
     }
 }
 
-/// @dev Deploys `Payment` with plain CREATE, so tests can read the constructor's
-/// own revert data, which CREATE3 would replace with `DeploymentFailed`.
+/// @dev Deploys `Payment` with plain CREATE, at an address tests can predict
+/// from this contract's nonce, with the same arguments `PaymentFactory` passes.
 contract PaymentDirectDeployer {
+    address internal immutable IMPLEMENTATION = new PaymentFactory().paymentImplementation();
+
     function deploy(
         address token,
         uint256 amount,
@@ -217,7 +229,9 @@ contract PaymentDirectDeployer {
         address recovery,
         uint256 chainId
     ) external returns (Payment) {
-        return new Payment(token, amount, calls, expirationTimestamp, recovery, chainId);
+        return new Payment(
+            IMPLEMENTATION, abi.encode(token, amount, calls, expirationTimestamp, recovery, bytes32(0), chainId)
+        );
     }
 }
 

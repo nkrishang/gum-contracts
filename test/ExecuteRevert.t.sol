@@ -7,7 +7,6 @@ import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
-import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 
 /// @notice Pins what `execute` reverts with, which the backend decodes: the
 /// `Payment` constructor's own error, `AlreadyDeployed` for a payment that has
@@ -48,7 +47,7 @@ contract ExecuteRevertTest is Test {
         _execute(calls, bytes32(uint256(2)));
         assertGt(paymentAddress.code.length, 0);
 
-        vm.expectRevert(BubblingCREATE3.AlreadyDeployed.selector);
+        vm.expectRevert(PaymentFactory.AlreadyDeployed.selector);
         _execute(calls, bytes32(uint256(2)));
     }
 
@@ -93,12 +92,22 @@ contract ExecuteRevertTest is Test {
         address paymentAddress = _address(calls, bytes32(uint256(6)));
         token.mint(paymentAddress, AMOUNT);
 
-        vm.expectRevert(BubblingCREATE3.DeploymentFailed.selector);
-        factory.execute{gas: 300_000}(
-            address(token), AMOUNT, calls, expirationTimestamp, RECOVERY, bytes32(uint256(6)), block.chainid
-        );
+        // Scan up from too little gas for the factory itself; some limit starves
+        // the constructor while leaving the factory enough to report it.
+        bool starved;
+        for (uint256 gasLimit = 20_000; gasLimit < 500_000 && !starved; gasLimit += 1_000) {
+            try factory.execute{gas: gasLimit}(
+                address(token), AMOUNT, calls, expirationTimestamp, RECOVERY, bytes32(uint256(6)), block.chainid
+            ) {
+                revert("settled before any limit starved the constructor");
+            } catch (bytes memory reason) {
+                starved =
+                    keccak256(reason) == keccak256(abi.encodeWithSelector(PaymentFactory.DeploymentFailed.selector));
+            }
+            assertEq(paymentAddress.code.length, 0);
+        }
+        assertTrue(starved, "no gas limit produced DeploymentFailed");
 
-        assertEq(paymentAddress.code.length, 0);
         _execute(calls, bytes32(uint256(6)));
         assertTrue(Payment(paymentAddress).SETTLED(), "a retry with enough gas settles");
     }

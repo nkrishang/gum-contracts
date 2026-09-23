@@ -8,8 +8,34 @@ import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
-import {LegacyPayment} from "test/benchmark/legacy/LegacyPayment.sol";
-import {LegacyPaymentFactory} from "test/benchmark/legacy/LegacyPaymentFactory.sol";
+import {LegacyPaymentFactoryBytecode} from "test/benchmark/LegacyPaymentFactoryBytecode.sol";
+
+/// @dev The previous generation's surface; its bytecode is in `LegacyPaymentFactoryBytecode`.
+interface ILegacyPaymentFactory {
+    function paymentAddress(
+        address token,
+        uint256 amount,
+        address receiver,
+        uint64 expirationTimestamp,
+        address recovery,
+        bytes32 salt,
+        uint256 chainId
+    ) external view returns (address payable);
+
+    function execute(
+        address token,
+        uint256 amount,
+        address receiver,
+        uint64 expirationTimestamp,
+        address recovery,
+        bytes32 salt,
+        uint256 chainId
+    ) external;
+}
+
+interface ILegacyPayment {
+    function SETTLED() external view returns (bool);
+}
 
 /// @notice Gas cost of the same job, paying `amount` of a stablecoin to a
 /// receiver on settlement, under the previous generation (`receiver`) and the
@@ -36,7 +62,7 @@ abstract contract PaymentGasBenchmark is Test {
 
     address internal token;
     uint256 internal amount;
-    LegacyPaymentFactory internal legacyFactory;
+    ILegacyPaymentFactory internal legacyFactory;
     PaymentFactory internal factory;
     uint64 internal expiry;
 
@@ -49,7 +75,7 @@ abstract contract PaymentGasBenchmark is Test {
     function _deployFactories() internal {
         receiver = makeAddr("gum-benchmark-receiver");
         recovery = makeAddr("gum-benchmark-recovery");
-        legacyFactory = new LegacyPaymentFactory();
+        legacyFactory = ILegacyPaymentFactory(LegacyPaymentFactoryBytecode.deploy());
         factory = new PaymentFactory();
         expiry = uint64(block.timestamp + 1 hours);
     }
@@ -97,8 +123,13 @@ abstract contract PaymentGasBenchmark is Test {
         _row("calldata bytes", legacy.calldataBytes, current.calldataBytes);
         console2.log(
             string.concat(
-                "  overhead: +",
-                _percent(current.transaction - legacy.transaction, legacy.transaction),
+                current.transaction >= legacy.transaction ? "  change: +" : "  change: -",
+                _percent(
+                    current.transaction >= legacy.transaction
+                        ? current.transaction - legacy.transaction
+                        : legacy.transaction - current.transaction,
+                    legacy.transaction
+                ),
                 " of the legacy transaction"
             )
         );
@@ -112,11 +143,11 @@ abstract contract PaymentGasBenchmark is Test {
         m = _measure(
             address(legacyFactory),
             abi.encodeCall(
-                LegacyPaymentFactory.execute, (token, amount, receiver, expiry, recovery, SALT, block.chainid)
+                ILegacyPaymentFactory.execute, (token, amount, receiver, expiry, recovery, SALT, block.chainid)
             )
         );
 
-        assertTrue(LegacyPayment(payment).SETTLED());
+        assertTrue(ILegacyPayment(payment).SETTLED());
         assertEq(ERC20(token).balanceOf(receiver) - receiverBefore, amount, "legacy paid the receiver");
     }
 

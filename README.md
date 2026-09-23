@@ -10,7 +10,7 @@ Built with [Foundry](https://book.getfoundry.sh/) and [Solady](https://github.co
 
 | Contract | Purpose |
 | --- | --- |
-| [`PaymentFactory`](src/PaymentFactory.sol) | Ownerless CREATE3 deployer that derives a deterministic payment address from the payment's terms and executes it. |
+| [`PaymentFactory`](src/PaymentFactory.sol) | Ownerless CREATE2 deployer that derives a deterministic payment address from the payment's terms and executes it. |
 | [`Payment`](src/Payment.sol) | Single-use contract whose constructor runs committed calls that spend exactly the payment amount, and sends everything else to a recovery address. |
 | [`BatchSweeper`](src/BatchSweeper.sol) | Executes many independent payments in one transaction; one failure never rolls back the others. |
 | [`WithdrawalForwarder`](src/WithdrawalForwarder.sol) | Bridges USDC through CCTP V2 on the strength of one EIP-3009 signature that commits to the destination. |
@@ -46,15 +46,17 @@ A payment is described by seven parameters:
 | `salt` | Distinguishes otherwise identical payments |
 | `chainId` | The only chain on which the payment may settle |
 
-`PaymentFactory` hashes all seven into a CREATE3 salt, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given.
-
-The factory deploys through [`BubblingCREATE3`](src/utils/BubblingCREATE3.sol), whose proxy differs from Solady's so that constructor reverts reach the caller. To derive an address offchain, use the proxy's init code hash `0xc57c9b86f6f9162380bc9ddd7e90e8a4a1bab25d7dc6981dc9bf0d85f3490ef9`, not Solady's:
+All seven are constructor arguments in `Payment`'s CREATE2 init code, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given. To derive an address offchain:
 
 ```
-salt    = keccak256(abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId))
-proxy   = keccak256(0xff ++ factory ++ salt ++ 0xc57c9b86…0ef9)[12:]
-payment = keccak256(0xd694 ++ proxy ++ 0x01)[12:]
+terms    = abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId)
+initCode = Payment.creationCode ++ abi.encode(factory.paymentImplementation(), terms)
+payment  = keccak256(0xff ++ factory ++ bytes32(0) ++ keccak256(initCode))[12:]
 ```
+
+`terms` is exactly the calldata arguments of `paymentAddress` and `execute`, which build the init code from their own calldata. `Payment.creationCode` is the build artifact's `bytecode`, the same for every payment of a generation.
+
+A deployed payment's code is a 65-byte stub, not `Payment`'s runtime. The stub delegatecalls one shared implementation, which is `Payment`'s runtime deployed by the factory's constructor at the factory's nonce-1 CREATE address. `recovery` and the settled flag are appended to the stub's code, and `recover` and `SETTLED` read them from there. Storing 65 bytes instead of the whole runtime is most of what makes a payment cheap to execute; [`test/benchmark/PaymentGas.t.sol`](test/benchmark/PaymentGas.t.sol) measures it against the previous generation.
 
 ```
 1. Quote     factory.paymentAddress(...)  ->  counterfactual address, no code yet
@@ -209,8 +211,7 @@ GUM_CHAIN_ID=<chain-id> forge script script/Bootstrap.s.sol:BootstrapScript \
 ```
 src/
   Payment.sol               Self-settling payment contract with committed calls
-  PaymentFactory.sol        CREATE3 factory and address derivation
-  utils/BubblingCREATE3.sol CREATE3 that bubbles up constructor reverts
+  PaymentFactory.sol        CREATE2 factory and address derivation
   BatchSweeper.sol          Batched execute / recover
   WithdrawalForwarder.sol   EIP-3009 + CCTP V2 withdrawal bridge
   mock/MockStablecoin.sol   FiatToken-like fixture for tests and Anvil

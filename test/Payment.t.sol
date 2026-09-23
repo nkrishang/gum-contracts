@@ -1,27 +1,16 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.24;
 
 import {Test} from "lib/forge-std/src/Test.sol";
 import {Vm} from "lib/forge-std/src/Vm.sol";
 import {SafeTransferLib} from "lib/solady/src/utils/SafeTransferLib.sol";
-import {BubblingCREATE3} from "src/utils/BubblingCREATE3.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
 import {MockStablecoin} from "src/mock/MockStablecoin.sol";
 import {Payment} from "src/Payment.sol";
 import {PaymentFactory} from "src/PaymentFactory.sol";
+import {PaymentDirectDeployer} from "test/utils/SettlementFixtures.sol";
 
-contract PaymentDeployer {
-    function deploy(
-        address token,
-        uint256 amount,
-        Payment.Call[] memory calls,
-        uint64 expirationTimestamp,
-        address recovery,
-        uint256 chainId
-    ) external returns (Payment) {
-        return new Payment(token, amount, calls, expirationTimestamp, recovery, chainId);
-    }
-}
+contract PaymentDeployer is PaymentDirectDeployer {}
 
 contract PaymentTest is Test {
     event Called(uint256 indexed index, address indexed target, bytes data, bytes result);
@@ -261,7 +250,7 @@ contract PaymentTest is Test {
         assertEq(token.balanceOf(RECOVERY), 4e6);
 
         token.mint(paymentAddress, 6e6);
-        vm.expectRevert(BubblingCREATE3.AlreadyDeployed.selector);
+        vm.expectRevert(PaymentFactory.AlreadyDeployed.selector);
         factory.execute(address(token), 10e6, _pay(RECEIVER, 10e6), expirationTimestamp, RECOVERY, salt, block.chainid);
 
         assertEq(Payment(paymentAddress).recover(address(token)), 6e6);

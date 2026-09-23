@@ -24,7 +24,7 @@ What the constructor does:
 6. **Require the balance to be zero**, i.e. exactly `amount` was spent. Otherwise it reverts `AmountNotSpent(remaining)`.
 7. Set `SETTLED = true` and emit `Settled(token, amount)`.
 
-`PaymentFactory` hashes `(token, amount, calls, expirationTimestamp, recovery, salt, chainId)` into the CREATE3 salt, so every target, every byte of calldata and the order of the calls are fixed by the address. `BatchSweeper.Sweep` carries `calls` in place of `receiver`.
+`PaymentFactory` passes `abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId)` as a constructor argument in `Payment`'s CREATE2 init code, so every target, every byte of calldata and the order of the calls are fixed by the address. `BatchSweeper.Sweep` carries `calls` in place of `receiver`.
 
 ### Why this shape
 
@@ -53,10 +53,21 @@ What the constructor does:
 
 - The payment has no code while its calls run, so targets must not call back into it. Raw Uniswap pool swaps and flash loans are therefore out; routers that pull via `transferFrom` are fine.
 - Approve exactly what the next call pulls.
-- `execute` reverts with the constructor's own error: it deploys through `BubblingCREATE3`, whose proxy reverts with the revert data of its failed `CREATE` (Solady's proxy discards it). An executed payment reverts `AlreadyDeployed()`, and `DeploymentFailed()` is left for reverts without data. The proxy change moves every address, so offchain derivation must use `BubblingCREATE3.PROXY_INITCODE_HASH`.
+- `execute` reverts with the constructor's own error, since it deploys `Payment` directly with CREATE2 and passes on its revert data. An executed payment reverts `AlreadyDeployed()`, and `DeploymentFailed()` is left for reverts without data. Offchain derivation is standard CREATE2 with constructor arguments; see the README.
 - Calls are part of a payment's identity. The backend must store the full call list to derive the address and to execute it.
 - An action that fails permanently (sold out, bad calldata) keeps the funds at the address until expiry, and then refunds them to `recovery`. So simulate calls when quoting a payment, and exclude failing items from sweep batches.
 - A heavy call list uses its share of the batch's gas. Give such items their own batches, or cap the gas per item.
+
+## Gas
+
+A payment is paid for once, on `execute`, so that is what the layout optimizes. For the plain case, one `transfer` to a merchant that already holds the token, the whole transaction costs about 97k gas against 315k for the previous generation's live bytecode (`test/benchmark/PaymentGas.t.sol`; 103k vs 320k against Base USDC). The savings, largest first:
+
+- **A 65-byte stub instead of the runtime (~185k).** Deploying code costs 200 gas per byte, and the runtime was nearly 1 KB. Each payment now stores a minimal delegatecall proxy (44 bytes), then `recovery` and the settled flag (21 bytes). The proxy points at `Payment`'s runtime, which the factory deploys once. `recover` and `SETTLED` run in the stub's context, read their two values with `EXTCODECOPY`, and refuse to run anywhere else.
+- **CREATE2 instead of CREATE3 (~37k).** CREATE3 deploys a proxy that then deploys the contract, which costs a second contract creation. Putting the terms in the init code gets the same commitment from a single CREATE2. It also lets the factory pass on the constructor's revert data, since `CREATE2` exposes it directly.
+- **No copying of terms.** `execute` copies its calldata into the init code verbatim, and the constructor reads the terms where the ABI decoder left them. It never decodes `Call[]` into structs, and it builds each `Called` event's data in one scratch region.
+- **The optimizer**, at 1,000,000 runs, for the Solidity parts.
+
+What remains is mostly inherent: the 21k transaction base, the 32k `CREATE2`, the stub's 13k deposit, and the token's own work. We considered a transient-storage callback (constant init code, terms fetched from the factory), which is how Uniswap v3 pools get their parameters. It measured about 4.4k gas more than constructor arguments.
 
 ## What competitors ship
 
