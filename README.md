@@ -22,9 +22,9 @@ The current generation is live at the same addresses on Monad, Base and Arbitrum
 
 | Contract | Address |
 | --- | --- |
-| `PaymentFactory` | `0x7D0790f8983F028bDa32c44c40b50EBE902Fe17B` |
-| `BatchSweeper` | `0xf58a0A9Df7764784dF01Aa7f10094Fc1A5a72b97` |
-| `WithdrawalForwarder` | `0x7f66A10D96d369Dab93e121415772b9F752Bc0d1` |
+| `PaymentFactory` | `0x6D85B9706D8f076cB8A9fEA37d70Fcb8D22C2952` |
+| `BatchSweeper` | `0x36f9F98eD9e9D2140B070De2ac9E538094012873` |
+| `WithdrawalForwarder` | `0xf37A9310b3df36A6c87401CFe32e7E5c2F49Aef7` |
 
 | Chain | Chain ID |
 | --- | --- |
