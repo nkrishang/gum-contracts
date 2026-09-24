@@ -12,7 +12,7 @@ contract BatchSweeper {
     struct Sweep {
         address token;
         uint256 amount;
-        address receiver;
+        Payment.Call[] calls;
         uint64 expirationTimestamp;
         address recovery;
         bytes32 salt;
@@ -22,6 +22,7 @@ contract BatchSweeper {
     //---------- Events ----------//
 
     /// @notice Emitted on failure of `factory.execute` (fresh deployment) or `Payment.recover`.
+    /// For a deployment, `revertData` is the `Payment` constructor's own error.
     event SweepFailed(address indexed paymentAddress, address indexed token, bytes revertData);
 
     //---------- Storage ----------//
@@ -38,7 +39,7 @@ contract BatchSweeper {
             address paymentAddress = FACTORY.paymentAddress(
                 sweep.token,
                 sweep.amount,
-                sweep.receiver,
+                sweep.calls,
                 sweep.expirationTimestamp,
                 sweep.recovery,
                 sweep.salt,
@@ -56,7 +57,7 @@ contract BatchSweeper {
             try FACTORY.execute(
                 sweep.token,
                 sweep.amount,
-                sweep.receiver,
+                sweep.calls,
                 sweep.expirationTimestamp,
                 sweep.recovery,
                 sweep.salt,

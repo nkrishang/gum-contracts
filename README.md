@@ -10,8 +10,8 @@ Built with [Foundry](https://book.getfoundry.sh/) and [Solady](https://github.co
 
 | Contract | Purpose |
 | --- | --- |
-| [`PaymentFactory`](src/PaymentFactory.sol) | Ownerless CREATE3 deployer that derives a deterministic payment address from the payment's terms and executes it. |
-| [`Payment`](src/Payment.sol) | Single-use contract whose constructor pays the receiver and sends everything else to a recovery address. |
+| [`PaymentFactory`](src/PaymentFactory.sol) | Ownerless CREATE2 deployer that derives a deterministic payment address from the payment's terms and executes it. |
+| [`Payment`](src/Payment.sol) | Single-use contract whose constructor runs committed calls that spend exactly the payment amount, and sends everything else to a recovery address. |
 | [`BatchSweeper`](src/BatchSweeper.sol) | Executes many independent payments in one transaction; one failure never rolls back the others. |
 | [`WithdrawalForwarder`](src/WithdrawalForwarder.sol) | Bridges USDC through CCTP V2 on the strength of one EIP-3009 signature that commits to the destination. |
 | [`MockStablecoin`](src/mock/MockStablecoin.sol) | Local-only six-decimal token mirroring Circle FiatToken's pause, blacklist and EIP-3009 behaviour. |
@@ -39,14 +39,24 @@ A payment is described by seven parameters:
 | Parameter | Meaning |
 | --- | --- |
 | `token` | The ERC-20 being paid |
-| `amount` | The amount owed to the receiver |
-| `receiver` | Who gets paid |
+| `amount` | The amount the calls must spend |
+| `calls` | Ordered `Call{target, data}` list the payment executes on settlement |
 | `expirationTimestamp` | After this, the payment no longer settles |
-| `recovery` | Where any funds that aren't owed to the receiver go |
+| `recovery` | Where any funds that aren't spent by the calls go |
 | `salt` | Distinguishes otherwise identical payments |
 | `chainId` | The only chain on which the payment may settle |
 
-`PaymentFactory` hashes all seven into a CREATE3 salt, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given.
+All seven are constructor arguments in `Payment`'s CREATE2 init code, so **the address itself commits to the routing of funds**. Changing any parameter yields a different address, and nobody can deploy different logic at the address the payer was given. To derive an address offchain:
+
+```
+terms    = abi.encode(token, amount, calls, expirationTimestamp, recovery, salt, chainId)
+initCode = Payment.creationCode ++ abi.encode(factory.paymentImplementation(), terms)
+payment  = keccak256(0xff ++ factory ++ bytes32(0) ++ keccak256(initCode))[12:]
+```
+
+`terms` is exactly the calldata arguments of `paymentAddress` and `execute`, which build the init code from their own calldata. `Payment.creationCode` is the build artifact's `bytecode`, the same for every payment of a generation.
+
+A deployed payment's code is a 65-byte stub, not `Payment`'s runtime. The stub delegatecalls one shared implementation, which is `Payment`'s runtime deployed by the factory's constructor at the factory's nonce-1 CREATE address. `recovery` and the settled flag are appended to the stub's code, and `recover` and `SETTLED` read them from there. Storing 65 bytes instead of the whole runtime is most of what makes a payment cheap to execute; [`test/benchmark/PaymentGas.t.sol`](test/benchmark/PaymentGas.t.sol) measures it against the previous generation.
 
 ```
 1. Quote     factory.paymentAddress(...)  ->  counterfactual address, no code yet
@@ -59,7 +69,8 @@ What the `Payment` constructor does with the balance:
 
 | Situation | Outcome |
 | --- | --- |
-| Funded, not expired | `amount` goes to `receiver`, any excess to `recovery`. Emits `Settled`, and `SETTLED` is `true`. |
+| Funded, not expired | Any excess goes to `recovery` first. The calls then run in order and must spend exactly `amount`. Emits `Recovered` for any excess, `Called` after each call, then `Settled`, and `SETTLED` is `true`. |
+| A call reverts, targets an address with no code, or the calls leave part of `amount` unspent | Reverts with `CallFailed(index, revertData)`, which carries the failing call's own revert data, `CallTargetHasNoCode(index, target)` or `AmountNotSpent`. Nothing moves, and `execute` can be retried. |
 | Underfunded, not expired | Reverts with `InsufficientTokenBalance`. No code is left behind, so `execute` can be retried once the balance arrives. |
 | Expired (`block.timestamp > expirationTimestamp`) | The whole balance goes to `recovery`. Emits `Recovered`. |
 | Wrong chain (`block.chainid != chainId`) | Moves nothing and emits `WrongChain`. Deployment still succeeds, even if `token` has no code on this chain, so `recover` stays callable. |
@@ -68,10 +79,30 @@ After deployment, `recover(token)` is a permissionless call that forwards the co
 
 Things worth knowing when integrating:
 
-- `execute` surfaces constructor failures as Solady's `CREATE3.DeploymentFailed`, not the inner error. Both an underfunded payment and an already-executed payment revert this way; tell them apart by checking whether the address has code. [`test/ExecuteRevert.t.sol`](test/ExecuteRevert.t.sol) pins this behaviour.
-- Settlement is atomic. If the excess can't be delivered to `recovery` (for example, a blacklisted address), the whole deployment reverts and the receiver is not paid either.
+- `execute` reverts with the `Payment` constructor's own revert data, e.g. `InsufficientTokenBalance(balance, required)`, `CallFailed(index, revertData)`, `AmountNotSpent(remaining)` or a token's transfer error, so decode it against the `Payment` ABI. It reverts with `AlreadyDeployed()` once the payment has executed, and with `DeploymentFailed()` only when the constructor reverted without data, e.g. out of gas. `BatchSweeper` reports the same data in `SweepFailed`. [`test/ExecuteRevert.t.sol`](test/ExecuteRevert.t.sol) pins this behaviour.
+- Settlement is atomic. If the excess can't be delivered to `recovery` (for example, a blacklisted address), or any call fails, the whole deployment reverts and nothing is paid.
 - The expiry boundary is inclusive: a payment executed at exactly `expirationTimestamp` still settles.
 - The factory must live at the same address on every supported chain so that the same terms produce the same payment address everywhere. That is what makes funds sent on the wrong chain recoverable.
+
+### Settlement calls
+
+The calls are how a payment triggers onchain actions. A plain payment is a single call, `token.transfer(receiver, amount)`. Some other shapes:
+
+| Action | Calls |
+| --- | --- |
+| Pay a merchant | `token.transfer(merchant, amount)` |
+| Split with a platform fee | `token.transfer(merchant, amount - fee)`, `token.transfer(platform, fee)` |
+| Deposit into an ERC-4626 vault | `token.approve(vault, amount)`, `vault.deposit(amount, merchant)` |
+| Settle and notify a merchant contract | `token.transfer(merchant, amount)`, `merchantContract.markPaid(orderId)` |
+
+Rules the calls must follow:
+
+- **Every target and every byte of calldata is committed into the address.** Anyone can therefore verify what a payment will do offchain, before paying, by recomputing the address. The contracts enforce no allowlist, and the chosen calls are exactly what runs.
+- **Calls run as the payment address, inside its constructor.** The payment has no code yet, so a target that calls back into it, such as a swap callback or a flash-loan callback, fails. Targets should not care who calls them. A target that must know it was paid should pull the tokens with `transferFrom` rather than trust `msg.sender`. Alternatively, it can take the payment's terms as arguments and check that the factory derives `msg.sender` from them; `AuthenticatedOrderBook` in [`test/utils/SettlementFixtures.sol`](test/utils/SettlementFixtures.sol) shows how.
+- **The calls must spend exactly `amount`.** The excess has already gone to `recovery` when they run, so they cannot spend more. Leaving any of it unspent reverts with `AmountNotSpent`. A call to an address with no code reverts with `CallTargetHasNoCode`, because it would otherwise succeed and do nothing.
+- **Approvals should be exact.** An approval the target doesn't fully use outlives the constructor, and would let that spender pull late funds before `recover` sweeps them. Check this offchain along with the rest of the calls.
+- **Calls carry no native value**, and expired or wrong-chain payments never run their calls.
+- **The payment is bounded in size.** The init code — which includes every call's calldata — must stay within EIP-3860's 49,152-byte limit; beyond it, `paymentAddress` and `execute` revert with `InitCodeTooLarge` rather than offer an address that could never be deployed or recovered from.
 
 ### Batch sweeping
 
@@ -79,7 +110,7 @@ Things worth knowing when integrating:
 
 - If the payment address has no code, it calls `factory.execute`.
 - If the payment is already deployed, it calls `recover` instead, picking up any funds that arrived late.
-- Failures are caught and reported as `SweepFailed(paymentAddress, token, revertData)` rather than reverting the batch, so a paused token, a blacklisted receiver or an underfunded item only affects itself.
+- Failures are caught and reported as `SweepFailed(paymentAddress, token, revertData)` rather than reverting the batch, so a paused token, a failing call or an underfunded item only affects itself.
 
 ## How withdrawals work
 
@@ -125,13 +156,13 @@ The default run is fully offline. Fork tests are skipped unless you opt in:
 GUM_FORK_TESTS=1 forge test
 ```
 
-Fork tests exercise the forwarder against the live USDC and CCTP V2 contracts, and verify that USDT0 accepts the EIP-3009 authorizations and EIP-712 domain the backend reconstructs. Each chain uses a public RPC by default, which you can override:
+Fork tests exercise the forwarder and settlement calls (plain transfers, fee splits, CCTP V2 burns, blacklisted recipients) against the live USDC, USDT0 and CCTP V2 contracts, and verify that USDT0 accepts the EIP-3009 authorizations and EIP-712 domain the backend reconstructs. Each chain uses a public RPC by default, which you can override:
 
 | Chain | Chain ID | RPC override | Covers |
 | --- | --- | --- | --- |
-| Monad | `143` | `GUM_FORK_RPC_URL_143` | USDC + CCTP, USDT0 |
-| Base | `8453` | `GUM_FORK_RPC_URL_8453` | USDC + CCTP |
-| Arbitrum | `42161` | `GUM_FORK_RPC_URL_42161` | USDC + CCTP, USDT0 |
+| Monad | `143` | `GUM_FORK_RPC_URL_143` | USDC + CCTP, USDT0, settlement calls |
+| Base | `8453` | `GUM_FORK_RPC_URL_8453` | USDC + CCTP, settlement calls |
+| Arbitrum | `42161` | `GUM_FORK_RPC_URL_42161` | USDC + CCTP, USDT0, settlement calls |
 
 CI runs `forge fmt --check`, `forge build --sizes` and `forge test -vvv` on every push and pull request.
 
@@ -180,8 +211,8 @@ GUM_CHAIN_ID=<chain-id> forge script script/Bootstrap.s.sol:BootstrapScript \
 
 ```
 src/
-  Payment.sol               Self-settling payment contract
-  PaymentFactory.sol        CREATE3 factory and address derivation
+  Payment.sol               Self-settling payment contract with committed calls
+  PaymentFactory.sol        CREATE2 factory and address derivation
   BatchSweeper.sol          Batched execute / recover
   WithdrawalForwarder.sol   EIP-3009 + CCTP V2 withdrawal bridge
   mock/MockStablecoin.sol   FiatToken-like fixture for tests and Anvil
