@@ -31,6 +31,7 @@ The current generation is live at the same addresses on Monad, Base and Arbitrum
 | Monad | `143` |
 | Base | `8453` |
 | Arbitrum | `42161` |
+| Arc | `5042` |
 
 ## How payments work
 
