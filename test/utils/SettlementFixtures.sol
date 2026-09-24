@@ -216,6 +216,74 @@ contract FalseReturningToken is ERC20 {
     }
 }
 
+/// @dev A token whose `transfer` debits the sender one unit more than it asks,
+/// like a fee-on-transfer token that charges the sender extra.
+contract OverDebtorToken is ERC20 {
+    function name() public pure override returns (string memory) {
+        return "OverDebtor";
+    }
+
+    function symbol() public pure override returns (string memory) {
+        return "ODT";
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        _transfer(msg.sender, to, amount + 1);
+        return true;
+    }
+}
+
+/// @dev A token whose `transfer` debits the sender one unit less than it asks,
+/// like a rebate hook crediting the sender back.
+contract UnderDebtorToken is ERC20 {
+    function name() public pure override returns (string memory) {
+        return "UnderDebtor";
+    }
+
+    function symbol() public pure override returns (string memory) {
+        return "UDT";
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        _transfer(msg.sender, to, amount - 1);
+        return true;
+    }
+}
+
+/// @dev Returns `length` bytes of the repeating word `word`.
+contract HugeReturner {
+    function produce(uint256 length, uint256 word) external pure {
+        assembly {
+            for { let p := 0x00 } lt(p, length) { p := add(p, 0x20) } {
+                mstore(p, word)
+                mstore(add(p, 0x20), word)
+            }
+            return(0x00, length)
+        }
+    }
+}
+
+/// @dev Reverts with `length` bytes of the repeating word `word`.
+contract HugeReverter {
+    function reject(uint256 length, uint256 word) external pure {
+        assembly {
+            for { let p := 0x00 } lt(p, length) { p := add(p, 0x20) } {
+                mstore(p, word)
+                mstore(add(p, 0x20), word)
+            }
+            revert(0x00, length)
+        }
+    }
+}
+
 /// @dev Deploys `Payment` with plain CREATE, at an address tests can predict
 /// from this contract's nonce, with the same arguments `PaymentFactory` passes.
 contract PaymentDirectDeployer {
@@ -232,6 +300,16 @@ contract PaymentDirectDeployer {
         return new Payment(
             IMPLEMENTATION, abi.encode(token, amount, calls, expirationTimestamp, recovery, bytes32(0), chainId)
         );
+    }
+}
+
+/// @dev Deploys `Payment` with hand-crafted `terms` bytes, which only the
+/// constructor's own parsing sees: no ABI decoder validates their structure.
+contract RawPaymentDeployer {
+    address internal immutable IMPLEMENTATION = new PaymentFactory().paymentImplementation();
+
+    function deploy(bytes memory terms) external returns (Payment) {
+        return new Payment(IMPLEMENTATION, terms);
     }
 }
 

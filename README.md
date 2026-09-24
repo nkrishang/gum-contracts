@@ -102,6 +102,7 @@ Rules the calls must follow:
 - **The calls must spend exactly `amount`.** The excess has already gone to `recovery` when they run, so they cannot spend more. Leaving any of it unspent reverts with `AmountNotSpent`. A call to an address with no code reverts with `CallTargetHasNoCode`, because it would otherwise succeed and do nothing.
 - **Approvals should be exact.** An approval the target doesn't fully use outlives the constructor, and would let that spender pull late funds before `recover` sweeps them. Check this offchain along with the rest of the calls.
 - **Calls carry no native value**, and expired or wrong-chain payments never run their calls.
+- **The payment is bounded in size.** The init code — which includes every call's calldata — must stay within EIP-3860's 49,152-byte limit; beyond it, `paymentAddress` and `execute` revert with `InitCodeTooLarge` rather than offer an address that could never be deployed or recovered from.
 
 ### Batch sweeping
 

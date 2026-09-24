@@ -18,13 +18,17 @@ import {
     FalseReturningToken,
     Gate,
     GasBurner,
+    HugeReturner,
+    HugeReverter,
     MockVault,
     OpenSpender,
     OrderBook,
+    OverDebtorToken,
     PaymentCallsBase,
     RawReturner,
     Reentrant,
-    Reverter
+    Reverter,
+    UnderDebtorToken
 } from "test/utils/SettlementFixtures.sol";
 
 /// @notice Settlement calls: what a payment may do on settlement, and every way
@@ -375,6 +379,42 @@ contract PaymentCallsTest is PaymentCallsBase {
         directDeployer.deploy(address(falseToken), 10e6, calls, expiry, RECOVERY, block.chainid);
     }
 
+    /// @notice The recovery transfer must leave exactly `amount` before any call
+    /// runs. A token that debits the sender more than the transfer asks — a
+    /// fee-on-transfer token charging the sender — would otherwise shift the
+    /// shortfall onto the calls, which could underpay the merchant and still
+    /// leave a zero balance.
+    function test_a_transfer_that_over_debits_the_sender_reverts_before_the_calls() public {
+        OverDebtorToken overDebtor = new OverDebtorToken();
+        address predicted = vm.computeCreateAddress(address(directDeployer), vm.getNonce(address(directDeployer)));
+        overDebtor.mint(predicted, 120e6);
+        Payment.Call[] memory calls =
+            _list(_call(address(overDebtor), abi.encodeCall(ERC20.transfer, (MERCHANT, 98e6))));
+
+        // Recovery is sent 20e6 but the transfer debits 20e6 + 1, leaving 100e6 - 1.
+        vm.expectRevert(abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 100e6 - 1, 100e6));
+        directDeployer.deploy(address(overDebtor), 100e6, calls, expiry, RECOVERY, block.chainid);
+
+        assertEq(overDebtor.balanceOf(MERCHANT), 0, "no call may run");
+    }
+
+    /// @notice The mirror image: a token that debits less than asked, like a
+    /// rebate hook, would let the calls spend more than `amount` of the
+    /// payment's funds. Also caught by the same check.
+    function test_a_transfer_that_under_debits_the_sender_reverts_before_the_calls() public {
+        UnderDebtorToken underDebtor = new UnderDebtorToken();
+        address predicted = vm.computeCreateAddress(address(directDeployer), vm.getNonce(address(directDeployer)));
+        underDebtor.mint(predicted, 120e6);
+        Payment.Call[] memory calls =
+            _list(_call(address(underDebtor), abi.encodeCall(ERC20.transfer, (MERCHANT, 98e6))));
+
+        // Recovery is sent 20e6 but the transfer debits 20e6 - 1, leaving 100e6 + 1.
+        vm.expectRevert(abi.encodeWithSelector(Payment.InsufficientTokenBalance.selector, 100e6 + 1, 100e6));
+        directDeployer.deploy(address(underDebtor), 100e6, calls, expiry, RECOVERY, block.chainid);
+
+        assertEq(underDebtor.balanceOf(MERCHANT), 0, "no call may run");
+    }
+
     //---------- Failures ----------//
 
     /// @notice A failing call reverts the whole deployment: earlier calls and
@@ -598,6 +638,50 @@ contract PaymentCallsTest is PaymentCallsBase {
         vm.expectEmit(true, true, true, true, payment);
         emit Called(0, address(token), calls[0].data, abi.encode(uint256(1e6)));
         _execute(10e6, calls);
+    }
+
+    /// @notice A result larger than 64 KiB is reported in full, not truncated.
+    /// The huge return data comes from small calldata, since the calls
+    /// themselves are committed into the init code.
+    function test_a_large_result_is_reported_in_full() public {
+        HugeReturner returner = new HugeReturner();
+        uint256 length = 66_048; // 64 KiB + 512, a multiple of 32.
+        uint256 word = uint256(0xdeadbeefc0ffeee1);
+        bytes memory result = new bytes(length);
+        for (uint256 i; i < length / 32; ++i) {
+            assembly {
+                mstore(add(add(result, 0x20), mul(i, 32)), word)
+            }
+        }
+        Payment.Call[] memory calls = _list(
+            _call(address(returner), abi.encodeCall(HugeReturner.produce, (length, word))), _transfer(MERCHANT, 10e6)
+        );
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectEmit(true, true, true, true, payment);
+        emit Called(0, address(returner), calls[0].data, result);
+        _execute(10e6, calls);
+        assertEq(token.balanceOf(MERCHANT), 10e6);
+    }
+
+    /// @notice Revert data larger than 64 KiB is reported in full.
+    function test_large_revert_data_is_reported_in_full() public {
+        HugeReverter hugeReverter = new HugeReverter();
+        uint256 length = 66_048;
+        uint256 word = uint256(0xdeadbeefc0ffeee1);
+        bytes memory revertData = new bytes(length);
+        for (uint256 i; i < length / 32; ++i) {
+            assembly {
+                mstore(add(add(revertData, 0x20), mul(i, 32)), word)
+            }
+        }
+        Payment.Call[] memory calls =
+            _list(_call(address(hugeReverter), abi.encodeCall(HugeReverter.reject, (length, word))));
+        address payment = _fund(10e6, calls, 10e6);
+
+        vm.expectRevert(abi.encodeWithSelector(Payment.CallFailed.selector, 0, revertData));
+        _execute(10e6, calls);
+        assertEq(address(payment).code.length, 0, "nothing deployed");
     }
 
     //---------- Paths that run no calls ----------//

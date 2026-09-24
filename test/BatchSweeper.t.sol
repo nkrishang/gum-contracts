@@ -333,6 +333,20 @@ contract BatchSweeperTest is Test {
         assertEq(token.balanceOf(address(0xD6)), 20e6);
     }
 
+    /// @notice An item whose init code would exceed EIP-3860's 49,152-byte
+    /// limit has no derivable address at all: `paymentAddress` reverts, which
+    /// reverts the whole batch rather than sweep items that cannot be named.
+    function test_an_oversized_item_reverts_the_batch_with_init_code_too_large() public {
+        BatchSweeper.Sweep[] memory sweeps = new BatchSweeper.Sweep[](2);
+        sweeps[0] = _sweep(10e6, address(0xD7), bytes32(uint256(1)));
+        sweeps[1] = _sweep(10e6, address(0xD7), bytes32(uint256(2)));
+        sweeps[1].calls[0].data = abi.encodePacked(sweeps[1].calls[0].data, new bytes(49152));
+
+        vm.expectRevert();
+        batchSweeper.executeBatch(sweeps);
+        assertEq(token.balanceOf(address(0xD7)), 0);
+    }
+
     function _transferCall(address to, uint256 amount) private view returns (Payment.Call memory) {
         return Payment.Call({target: address(token), data: abi.encodeCall(ERC20.transfer, (to, amount))});
     }

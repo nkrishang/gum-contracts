@@ -30,6 +30,9 @@ contract PaymentFactory {
     error AlreadyDeployed();
     /// @notice The deployment failed without revert data, e.g. out of gas.
     error DeploymentFailed();
+    /// @notice The init code for these terms exceeds EIP-3860's 49,152-byte
+    /// limit, so the payment cannot be deployed; its address is not offered.
+    error InitCodeTooLarge(uint256 length);
 
     constructor() {
         // Deploy `Payment`'s runtime as the implementation every payment's stub
@@ -135,6 +138,8 @@ contract PaymentFactory {
     /// @dev Lays out `type(Payment).creationCode ++ abi.encode(paymentImplementation(), terms)`
     /// in memory, where `terms` is this call's calldata arguments, and returns its
     /// offset and length. Leaves it unallocated: callers hash or deploy it straight away.
+    /// Reverts with `InitCodeTooLarge` when the result exceeds EIP-3860's 49,152-byte
+    /// limit, so an address is never offered for terms that cannot be deployed.
     function _initCode() private view returns (uint256 offset, uint256 length) {
         bytes memory creationCode = type(Payment).creationCode;
         address implementation = paymentImplementation();
@@ -150,6 +155,11 @@ contract PaymentFactory {
             // Copying past the end of calldata writes zeros, which pads `terms`.
             calldatacopy(add(args, 0x60), 4, paddedLength)
             length := add(sub(args, offset), add(0x60, paddedLength))
+            if gt(length, 49152) {
+                mstore(0x00, 0x6c20ae80) // `InitCodeTooLarge(uint256)`.
+                mstore(0x20, length)
+                revert(0x1c, 0x24)
+            }
         }
     }
 }

@@ -35,7 +35,9 @@ contract Payment {
 
     //---------- Errors ----------//
 
-    /// @notice Emitted when the contract token balance is less than the target amount.
+    /// @notice Emitted when the contract token balance is less than the target
+    /// amount, or when the recovery transfer does not leave exactly the target
+    /// amount for the calls to spend.
     error InsufficientTokenBalance(uint256 balance, uint256 required);
     /// @notice Emitted when a call reverts, carrying the call's own revert data.
     error CallFailed(uint256 index, bytes revertData);
@@ -121,16 +123,22 @@ contract Payment {
             }
 
             // Runs call `i`, whose ABI-encoded `(target, data)` is at `element`,
-            // and emits `Called`, laying out event and revert data at `free`.
-            function runCall(i, element, free) {
+            // with `limit` the room from `element` to the end of `terms`, and
+            // emits `Called`, laying out event and revert data at `free`. The
+            // data offset and length are checked to sit within `terms`, so every
+            // executed byte is committed there rather than read from scratch.
+            function runCall(i, element, limit, free) {
                 let target := mload(element)
-                let data := add(element, mload(add(element, 0x20)))
+                let dataOffset := mload(add(element, 0x20))
+                // `data`'s length word must sit inside `terms`.
+                if gt(dataOffset, sub(limit, 0x20)) { revert(0x00, 0x00) }
+                let data := add(element, dataOffset)
                 let length := mload(data)
+                // So must every byte of `data` itself.
+                if gt(length, sub(sub(limit, dataOffset), 0x20)) { revert(0x00, 0x00) }
 
                 let success := call(gas(), target, 0, add(data, 0x20), length, 0x00, 0x00)
-                // Return and revert data beyond 64 KiB is truncated.
                 let resultLength := returndatasize()
-                if gt(resultLength, 0xffff) { resultLength := 0xffff }
 
                 if iszero(success) {
                     mstore(free, 0x5c0dee5d) // `CallFailed(uint256,bytes)`.
@@ -212,9 +220,38 @@ contract Payment {
                 log3(0x00, 0x20, _RECOVERED_TOPIC, mload(add(t, 0x80)), mload(t))
             }
 
-            let calls := add(t, mload(add(t, 0x40)))
+            // The recovery transfer must have left exactly `amount` to spend: a
+            // token whose transfers debit the sender by anything other than the
+            // amount sent would otherwise shift the accounting onto the calls.
+            // Standard tokens always pass this.
+            let available := selfBalance(mload(t))
+            if iszero(eq(available, mload(add(t, 0x20)))) {
+                mstore(0x40, mload(add(t, 0x20)))
+                mstore(0x20, available)
+                mstore(0x00, 0xa17124f8) // `InsufficientTokenBalance(uint256,uint256)`.
+                revert(0x1c, 0x44)
+            }
+
+            // The calls' offsets and lengths are untrusted: every word and byte
+            // they reference is checked to sit within `terms`, so a malformed
+            // list cannot point at scratch memory. Comparisons are subtractive,
+            // so they cannot overflow.
+            let end := add(t, mload(terms))
+            let callsOffset := mload(add(t, 0x40))
+            // The array's length word must sit inside `terms`.
+            if gt(callsOffset, sub(end, add(t, 0x20))) { revert(0x00, 0x00) }
+            let calls := add(t, callsOffset)
+            let elements := add(calls, 0x20)
+            let limitC := sub(end, calls) // At least 0x20: the length word is inside.
+            let limitE := sub(limitC, 0x20)
             for { let i := 0 } lt(i, mload(calls)) { i := add(i, 1) } {
-                runCall(i, add(add(calls, 0x20), mload(add(add(calls, 0x20), shl(5, i)))), free)
+                // Reading element `i`'s offset word, then the element's two head
+                // words, must stay inside `terms`.
+                if or(lt(limitC, 0x40), gt(shl(5, i), sub(limitC, 0x40))) { revert(0x00, 0x00) }
+                let elementOffset := mload(add(elements, shl(5, i)))
+                if or(lt(limitE, 0x40), gt(elementOffset, sub(limitE, 0x40))) { revert(0x00, 0x00) }
+                let element := add(elements, elementOffset)
+                runCall(i, element, sub(end, element), free)
             }
 
             let unspent := selfBalance(mload(t))
